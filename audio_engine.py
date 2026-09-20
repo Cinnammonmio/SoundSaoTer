@@ -1,0 +1,543 @@
+"""Audio engine: loads sound files and plays them to one or more output devices."""
+import threading
+from collections import deque
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+MAX_SECONDS = 120  # safety cap so a huge file can't eat all the RAM
+LIVE_MAX_MS = 120  # mic passthrough: drop the oldest audio past this much backlog
+
+
+def _to_channels(data: np.ndarray, channels: int) -> np.ndarray:
+    if data.shape[1] == channels:
+        return data
+    if data.shape[1] == 1:
+        return np.repeat(data, channels, axis=1)
+    if channels == 1:
+        return data.mean(axis=1, keepdims=True).astype(np.float32)
+    return np.repeat(data[:, :1], channels, axis=1)
+
+
+def _resample(data: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+    if sr_from == sr_to:
+        return data
+    n_new = int(round(data.shape[0] * sr_to / float(sr_from)))
+    if n_new <= 0:
+        return np.zeros((0, data.shape[1]), dtype=np.float32)
+    x_old = np.arange(data.shape[0], dtype=np.float64)
+    x_new = np.linspace(0, data.shape[0] - 1, n_new, dtype=np.float64)
+    out = np.empty((n_new, data.shape[1]), dtype=np.float32)
+    for c in range(data.shape[1]):
+        out[:, c] = np.interp(x_new, x_old, data[:, c])
+    return out
+
+
+class StreamResampler:
+    """Linear resampler that keeps its phase across calls, so a live stream has no clicks."""
+
+    def __init__(self, sr_in, sr_out, channels):
+        self.sr_in = sr_in
+        self.sr_out = sr_out
+        self.step = float(sr_in) / float(sr_out)
+        self.channels = channels
+        self.pos = 0.0
+        self.tail = np.zeros((1, channels), dtype=np.float32)
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        if self.sr_in == self.sr_out:
+            return block
+        buf = np.concatenate((self.tail, block))
+        last = buf.shape[0] - 1
+        count = int(np.floor((last - self.pos) / self.step)) + 1
+        if count <= 0:
+            self.pos -= last
+            self.tail = buf[-1:]
+            return np.zeros((0, self.channels), dtype=np.float32)
+        idx = self.pos + self.step * np.arange(count, dtype=np.float64)
+        grid = np.arange(buf.shape[0], dtype=np.float64)
+        out = np.empty((count, self.channels), dtype=np.float32)
+        for c in range(self.channels):
+            out[:, c] = np.interp(idx, grid, buf[:, c])
+        self.pos = idx[-1] + self.step - last
+        self.tail = buf[-1:]
+        return out
+
+
+class SoundCache:
+    """Reads a file once, then keeps a copy per (samplerate, channels) target."""
+
+    def __init__(self):
+        self._raw = {}      # path -> (data, samplerate)
+        self._conv = {}     # (path, sr, ch) -> data
+        self._lock = threading.Lock()
+
+    def raw(self, path):
+        with self._lock:
+            if path not in self._raw:
+                data, sr = sf.read(path, dtype='float32', always_2d=True)
+                if data.shape[0] > sr * MAX_SECONDS:
+                    data = data[:sr * MAX_SECONDS]
+                self._raw[path] = (data, sr)
+            return self._raw[path]
+
+    def get(self, path, samplerate, channels):
+        key = (path, samplerate, channels)
+        with self._lock:
+            hit = self._conv.get(key)
+        if hit is not None:
+            return hit
+        data, sr = self.raw(path)
+        conv = np.ascontiguousarray(_to_channels(_resample(data, sr, samplerate), channels))
+        with self._lock:
+            self._conv[key] = conv
+        return conv
+
+    def clear(self):
+        with self._lock:
+            self._raw.clear()
+            self._conv.clear()
+
+
+class DevicePlayer:
+    """One output stream on one device, mixing any number of overlapping sounds."""
+
+    def __init__(self, device_index):
+        info = sd.query_devices(device_index)
+        self.device = device_index
+        self.name = info['name']
+        self.channels = max(1, min(2, int(info['max_output_channels'])))
+        self.samplerate = int(info['default_samplerate']) or 48000
+        self._voices = []
+        self._lock = threading.Lock()
+        self._live = deque()
+        self._live_len = 0
+        self._live_max = int(self.samplerate * LIVE_MAX_MS / 1000)
+        self.live_gain = 1.0
+        self.stream = sd.OutputStream(
+            device=device_index,
+            samplerate=self.samplerate,
+            channels=self.channels,
+            dtype='float32',
+            latency='low',
+            callback=self._callback,
+        )
+        self.stream.start()
+
+    def _callback(self, outdata, frames, time_info, status):  # noqa: ARG002
+        outdata.fill(0.0)
+        with self._lock:
+            done = []
+            for voice in self._voices:
+                data, pos, gain = voice[0], voice[1], voice[2]
+                chunk = data[pos:pos + frames]
+                n = chunk.shape[0]
+                if n:
+                    outdata[:n] += chunk * gain
+                voice[1] = pos + n
+                if voice[1] >= data.shape[0]:
+                    done.append(voice)
+            for voice in done:
+                self._voices.remove(voice)
+            self._mix_live(outdata, frames)
+        np.clip(outdata, -1.0, 1.0, out=outdata)
+
+    def _mix_live(self, outdata, frames):
+        """Called with the lock held: drain the mic backlog into this block."""
+        written = 0
+        while written < frames and self._live:
+            chunk = self._live[0]
+            take = min(frames - written, chunk.shape[0])
+            outdata[written:written + take] += chunk[:take] * self.live_gain
+            if take == chunk.shape[0]:
+                self._live.popleft()
+            else:
+                self._live[0] = chunk[take:]
+            self._live_len -= take
+            written += take
+
+    def push_live(self, data):
+        """Queue mic audio already converted to this device's samplerate and channels."""
+        if data.shape[0] == 0:
+            return
+        with self._lock:
+            self._live.append(data)
+            self._live_len += data.shape[0]
+            while self._live_len > self._live_max and self._live:
+                dropped = self._live.popleft()
+                self._live_len -= dropped.shape[0]
+
+    def clear_live(self):
+        with self._lock:
+            self._live.clear()
+            self._live_len = 0
+
+    def play(self, data, gain=1.0, exclusive=True):
+        with self._lock:
+            if exclusive:
+                self._voices.clear()
+            self._voices.append([data, 0, float(gain)])
+
+    def stop(self):
+        with self._lock:
+            self._voices.clear()
+
+    def busy(self):
+        with self._lock:
+            return bool(self._voices)
+
+    def close(self):
+        try:
+            self.stop()
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+
+
+class MicInput:
+    """Reads the real microphone and feeds it straight into a DevicePlayer."""
+
+    def __init__(self, device_index, sink: DevicePlayer, monitor: DevicePlayer = None):
+        info = sd.query_devices(device_index)
+        self.device = device_index
+        self.name = info['name']
+        self.sink = sink
+        self.monitor = monitor          # your own headphones, for hearing yourself
+        self.monitor_on = False
+        self._mon_resampler = None
+        self.channels = max(1, min(2, int(info['max_input_channels'])))
+        self.muted = False
+        self.peak = 0.0
+        native = int(info['default_samplerate']) or 48000
+        self._resampler = None
+        # Matching the sink's rate avoids resampling entirely; fall back to the mic's own rate.
+        for rate in (sink.samplerate, native):
+            try:
+                self.stream = sd.InputStream(
+                    device=device_index,
+                    samplerate=rate,
+                    channels=self.channels,
+                    dtype='float32',
+                    latency='low',
+                    callback=self._callback,
+                )
+                self.samplerate = rate
+                break
+            except Exception:
+                if rate == native:
+                    raise
+        if self.samplerate != sink.samplerate:
+            self._resampler = StreamResampler(self.samplerate, sink.samplerate, self.channels)
+        if monitor is not None and monitor.samplerate != sink.samplerate:
+            # the monitor branch may run at a different rate than the cable
+            self._mon_resampler = StreamResampler(sink.samplerate, monitor.samplerate, 1)
+        self.stream.start()
+
+    def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
+        block = indata if self._resampler is None else self._resampler.process(indata)
+        peak = float(np.abs(block).max()) if block.shape[0] else 0.0
+        self.peak = max(peak, self.peak * 0.75)
+        if self.muted or block.shape[0] == 0:
+            return
+        # indata is a reused buffer, so always hand the sink a copy of its own.
+        self.sink.push_live(np.array(_to_channels(block, self.sink.channels), dtype=np.float32))
+
+        mon = self.monitor
+        if mon is not None and self.monitor_on:
+            mono = block.mean(axis=1, keepdims=True) if block.shape[1] > 1 else block
+            if self._mon_resampler is not None:
+                mono = self._mon_resampler.process(np.ascontiguousarray(mono, dtype=np.float32))
+            if mono.shape[0]:
+                mon.push_live(np.array(_to_channels(mono, mon.channels), dtype=np.float32))
+
+    def read_peak(self):
+        peak, self.peak = self.peak, self.peak * 0.5
+        return peak
+
+    def close(self):
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+        self.sink.clear_live()
+        if self.monitor is not None:
+            self.monitor.clear_live()
+
+
+class Engine:
+    """Plays a file to the game device (virtual cable) and, optionally, to your own headphones."""
+
+    def __init__(self):
+        self.cache = SoundCache()
+        self.players = {}     # role -> DevicePlayer
+        self.gains = {'game': 1.0, 'monitor': 1.0}
+        self.mic = None
+        self.mic_device = None
+        self.mic_gain = 1.0
+        self._preview = None
+        self.monitor_self = False
+        self.exclusive = True
+        self._lock = threading.Lock()
+
+    def set_device(self, role, device_index):
+        # the mic feeds both the cable and (optionally) the headphones, so either
+        # device changing means it has to be rebuilt against the new players
+        if role in ('game', 'monitor'):
+            self._stop_mic()
+        with self._lock:
+            old = self.players.pop(role, None)
+        if old is not None:
+            old.close()
+        player = None
+        if device_index is not None:
+            player = DevicePlayer(device_index)
+            with self._lock:
+                self.players[role] = player
+        if role in ('game', 'monitor'):
+            self._start_mic()   # follow the new devices
+        return player
+
+    # -- microphone passthrough: real mic -> the same virtual cable the game listens to --
+    def _stop_mic(self):
+        mic, self.mic = self.mic, None
+        if mic is not None:
+            mic.close()
+
+    def _start_mic(self):
+        if self.mic_device is None:
+            return None
+        sink = self.players.get('game')
+        if sink is None:
+            return None
+        sink.live_gain = self.mic_gain
+        monitor = self.players.get('monitor')
+        self.mic = MicInput(self.mic_device, sink, monitor)
+        self.mic.monitor_on = self.monitor_self
+        return self.mic
+
+    def set_monitor_self(self, on):
+        """Hear your own mic in the headphones — needed to tune the voice changer."""
+        self.monitor_self = bool(on)
+        if self.mic is not None:
+            self.mic.monitor_on = self.monitor_self
+            if not self.monitor_self and self.mic.monitor is not None:
+                self.mic.monitor.clear_live()
+        return self.monitor_self
+
+    def can_monitor_self(self):
+        return self.mic is not None and self.mic.monitor is not None
+
+    def set_mic(self, device_index):
+        self._stop_mic()
+        self.mic_device = device_index
+        return self._start_mic()
+
+    def set_mic_gain(self, gain):
+        self.mic_gain = float(gain)
+        sink = self.players.get('game')
+        if sink is not None:
+            sink.live_gain = self.mic_gain
+
+    def mic_peak(self):
+        return self.mic.read_peak() if self.mic is not None else 0.0
+
+    def device_ok(self, role):
+        with self._lock:
+            return role in self.players
+
+    def play(self, path):
+        with self._lock:
+            items = list(self.players.items())
+        if not items:
+            raise RuntimeError('no output device selected')
+        for role, player in items:
+            data = self.cache.get(path, player.samplerate, player.channels)
+            player.play(data, gain=self.gains.get(role, 1.0), exclusive=self.exclusive)
+
+    # -- preview: your ears only, never the game device --
+    def _preview_player(self):
+        monitor = self.players.get('monitor')
+        if monitor is not None:
+            return monitor, self.gains.get('monitor', 1.0)
+        existing = getattr(self, '_preview', None)
+        if existing is None:
+            game = self.players.get('game')
+            idx = safe_monitor_device(exclude={game.device} if game else ())
+            if idx is None:
+                return None, 0.0
+            existing = DevicePlayer(idx)
+            self._preview = existing
+        return existing, 1.0
+
+    def preview(self, path):
+        """Audition a file through the headphones without sending it to the cable."""
+        player, gain = self._preview_player()
+        if player is None:
+            raise RuntimeError('ไม่มีอุปกรณ์สำหรับฟัง — เลือกช่อง "ฟังเองที่หูฟัง" ก่อน')
+        data = self.cache.get(path, player.samplerate, player.channels)
+        player.play(data, gain=max(0.3, gain), exclusive=True)
+        return player.name
+
+    def stop(self):
+        with self._lock:
+            players = list(self.players.values())
+        preview = getattr(self, '_preview', None)
+        if preview is not None:
+            players.append(preview)
+        for player in players:
+            player.stop()
+
+    def close(self):
+        self._stop_mic()
+        with self._lock:
+            players = list(self.players.values())
+            self.players.clear()
+        preview = getattr(self, '_preview', None)
+        if preview is not None:
+            players.append(preview)
+            self._preview = None
+        for player in players:
+            player.close()
+
+
+def list_output_devices():
+    """[(index, label)] for every output device, host API included in the label."""
+    out = []
+    apis = sd.query_hostapis()
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev['max_output_channels'] < 1:
+            continue
+        api = apis[dev['hostapi']]['name']
+        out.append((idx, f"{dev['name']}  [{api}]"))
+    return out
+
+
+def list_input_devices():
+    """[(index, label)] for every recording device, host API included in the label."""
+    out = []
+    apis = sd.query_hostapis()
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] < 1:
+            continue
+        api = apis[dev['hostapi']]['name']
+        out.append((idx, f"{dev['name']}  [{api}]"))
+    return out
+
+
+def default_input_device():
+    """Windows' current default recording device, or None."""
+    try:
+        idx = sd.default.device[0]
+        return idx if idx is not None and idx >= 0 else None
+    except Exception:
+        return None
+
+
+def guess_mic_device(devices):
+    """Default mic, but never the virtual cable itself (that would feed back)."""
+    cable = ('cable output', 'vb-audio', 'voicemeeter', 'virtual cable', 'voicemod')
+    default = default_input_device()
+    for idx, label in devices:
+        if idx == default and not any(n in label.lower() for n in cable):
+            return idx
+    for idx, label in devices:
+        if not any(n in label.lower() for n in cable):
+            return idx
+    return None
+
+
+CABLE_NEEDLES = ('cable input', 'cable in ', 'cable in16', 'vb-audio', 'voicemeeter input',
+                 'voicemod virtual', 'virtual cable')
+
+
+def rank_cable_devices(devices):
+    """Virtual-cable playback devices, best candidate first."""
+    scored = []
+    for idx, label in devices:
+        low = label.lower()
+        if not any(n in low for n in CABLE_NEEDLES) or 'wdm-ks' in low:
+            continue
+        score = 0
+        if 'cable input' in low:
+            score += 2
+        if 'wasapi' in low:
+            score += 3
+        elif 'directsound' in low:
+            score += 1
+        scored.append((-score, idx))
+    return [idx for _s, idx in sorted(scored)]
+
+
+def can_open(device_index):
+    """True if an output stream on this device actually opens."""
+    try:
+        player = DevicePlayer(device_index)
+    except Exception:
+        return False
+    player.close()
+    return True
+
+
+def is_cable(label):
+    return any(n in label.lower() for n in CABLE_NEEDLES)
+
+
+def safe_monitor_device(exclude=()):
+    """A device you can actually hear yourself on.
+
+    Never a virtual cable: the VB-CABLE installer makes itself the Windows default
+    playback device, so falling back to the default blindly would send a preview
+    straight into the game.
+    """
+    devices = list_output_devices()
+    labels = dict(devices)
+
+    def usable(idx):
+        label = labels.get(idx, '').lower()
+        if idx in exclude or not label or is_cable(label) or 'wdm-ks' in label:
+            return False
+        return can_open(idx)
+
+    default = default_output_device()
+    if default is not None and usable(default):
+        return default
+
+    def rank(pair):
+        label = pair[1].lower()
+        return (1 if 'steam streaming' in label else 0,     # prefer real hardware
+                0 if 'wasapi' in label else 1)
+
+    for idx, _label in sorted(devices, key=rank):
+        if usable(idx):
+            return idx
+    return None
+
+
+def guess_cable_device(devices, verify=True):
+    """Best virtual-cable device, preferring one that really opens.
+
+    Windows can list endpoints that no longer exist — VB-CABLE often leaves a phantom
+    'CABLE Input' behind while the working half is 'CABLE In 16ch' — so the top-ranked
+    name is not trusted until a stream on it has opened.
+    """
+    ranked = rank_cable_devices(devices)
+    if not ranked:
+        return None
+    if not verify:
+        return ranked[0]
+    for idx in ranked:
+        if can_open(idx):
+            return idx
+    return ranked[0]
+
+
+def default_output_device():
+    """Windows' current default playback device, or None."""
+    try:
+        idx = sd.default.device[1]
+        return idx if idx is not None and idx >= 0 else None
+    except Exception:
+        return None

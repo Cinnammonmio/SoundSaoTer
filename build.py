@@ -1,0 +1,60 @@
+"""Build SoundSaoTer.exe — one file, no Python needed on the friend's PC.
+
+    python build.py
+
+ผลลัพธ์อยู่ที่  dist/SoundSaoTer.exe
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+NAME = 'SoundSaoTer'
+
+ARGS = [
+    sys.executable, '-m', 'PyInstaller',
+    '--noconfirm', '--clean',
+    '--onefile',
+    '--windowed',                       # no console window
+    '--name', NAME,
+    '--icon', os.path.join(HERE, 'icon.ico'),
+    '--add-data', f"{os.path.join(HERE, 'icon.ico')}{os.pathsep}.",
+    '--collect-all', 'customtkinter',   # ships its theme json + assets
+    '--collect-all', 'sounddevice',     # portaudio dll
+    '--collect-all', 'soundfile',       # libsndfile dll (mp3/ogg/flac support)
+    '--exclude-module', 'matplotlib',
+    '--exclude-module', 'pytest',
+    '--collect-all', 'pystray',         # system tray icon
+    '--collect-submodules', 'PIL',      # pystray renders the tray icon with Pillow
+    os.path.join(HERE, 'soundboard.py'),
+]
+
+
+def main():
+    icon = os.path.join(HERE, 'icon.ico')
+    if not os.path.isfile(icon):
+        print('ยังไม่มี icon.ico — สร้างก่อน')
+        subprocess.check_call([sys.executable, os.path.join(HERE, 'make_icon.py')])
+
+    print('กำลังสร้าง exe (ใช้เวลาสัก 1–3 นาที) ...\n')
+    subprocess.check_call(ARGS, cwd=HERE)
+
+    exe = os.path.join(HERE, 'dist', NAME + '.exe')
+    size = os.path.getsize(exe) / (1024 * 1024)
+    print(f'\nเสร็จแล้ว: {exe}  ({size:.0f} MB)')
+
+    # a ready-to-send folder next to the exe
+    share = os.path.join(HERE, 'dist', 'ส่งให้เพื่อน')
+    os.makedirs(share, exist_ok=True)
+    shutil.copy2(exe, share)
+    readme = os.path.join(HERE, 'อ่านก่อนใช้.txt')
+    if os.path.isfile(readme):
+        shutil.copy2(readme, share)
+    os.makedirs(os.path.join(share, 'sounds'), exist_ok=True)
+    print(f'โฟลเดอร์พร้อมส่ง: {share}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

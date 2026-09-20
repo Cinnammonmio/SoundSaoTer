@@ -1,0 +1,10 @@
+# ---- ใช้ตอนรันจาก source ----
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24
+customtkinter>=6.0.0
+# ฮอตคีย์ใช้ Win32 RegisterHotKey ผ่าน ctypes — ไม่ต้องลงไลบรารีเพิ่ม
+
+# ---- ใช้ตอนสร้าง .exe เท่านั้น (python build.py) ----
+# pyinstaller>=6.0
+# pillow>=10.0
