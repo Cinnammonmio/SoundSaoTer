@@ -12,7 +12,7 @@ BUILD_DATE = '2026-09-21'
 
 # ไฟล์ JSON ที่บอกว่าเวอร์ชันล่าสุดคืออะไรและโหลดได้จากไหน
 # ว่างไว้ = ปิดระบบตรวจอัปเดต
-UPDATE_MANIFEST_URL = ''
+UPDATE_MANIFEST_URL = 'https://github.com/Cinnammonmio/SoundSaoTer/releases/latest/download/latest.json'
 
 CHANGES = [
     ('1.0.0', 'เวอร์ชันแรก — soundboard, ฮอตคีย์, ผสมไมค์, โหลดเสียงจากเว็บ, tray, ฟังเสียงตัวเอง'),
