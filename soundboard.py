@@ -47,7 +47,6 @@ AUDIO_EXT = ('.wav', '.mp3', '.ogg', '.flac', '.aiff', '.aif', '.w64')
 NONE_LABEL = '— ไม่ใช้ —'
 MAX_ROWS = 250
 
-ctk.set_appearance_mode('dark')
 
 
 def default_config():
@@ -56,11 +55,49 @@ def default_config():
         'game_volume': 100, 'monitor_volume': 60, 'mic_volume': 100,
         'exclusive': True, 'hotkeys_enabled': True, 'tray': True, 'tray_notified': False,
         'stop_hotkey': 'ctrl+alt+s', 'sounds': [],
-        'hear_self': False, 'auto_update': True,
+        'hear_self': False, 'auto_update': True, 'theme': T.DEFAULT,
     }
 
 
+def peek_theme():
+    """Read just the theme from config.json — it has to be known before any widget exists."""
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as fh:
+            return json.load(fh).get('theme') or T.DEFAULT
+    except Exception:
+        return T.DEFAULT
+
+
 # --------------------------------------------------------------------------- widgets
+class ToggleGroup(ctk.CTkFrame):
+    """Row of buttons where one is selected. Unlike CTkSegmentedButton each state gets
+    its own text colour, so a selected neon-green segment can carry dark text."""
+
+    def __init__(self, master, values, variable, command=None):
+        super().__init__(master, fg_color='transparent')
+        self.variable, self.command, self.buttons = variable, command, {}
+        for i, value in enumerate(values):
+            btn = ctk.CTkButton(self, text=value, height=36, corner_radius=9,
+                                font=T.font(14, 'bold'), width=110,
+                                command=lambda v=value: self.select(v))
+            btn.pack(side='left', padx=(0 if i == 0 else 6, 0))
+            self.buttons[value] = btn
+        self._paint()
+
+    def select(self, value):
+        self.variable.set(value)
+        self._paint()
+        if self.command:
+            self.command(value)
+
+    def _paint(self):
+        for value, btn in self.buttons.items():
+            on = value == self.variable.get()
+            btn.configure(fg_color=T.PURPLE if on else T.INPUT,
+                          hover_color=T.PURPLE_DARK if on else T.SURFACE_3,
+                          text_color=T.ON_ACCENT if on else T.TEXT_DIM)
+
+
 class Card(ctk.CTkFrame):
     """A titled panel."""
 
@@ -83,7 +120,7 @@ class SoundRow(ctk.CTkFrame):
         self.play = ctk.CTkButton(
             self, text='▶', width=38, height=38, corner_radius=19,
             font=T.font(15), fg_color=T.PURPLE, hover_color=T.PURPLE_DARK,
-            text_color='#FFFFFF', command=lambda: app.play_path(data['path']))
+            text_color=T.ON_ACCENT, command=lambda: app.play_path(data['path']))
         self.play.pack(side='left', padx=(8, 12), pady=7)
 
         self.name = ctk.CTkLabel(self, text=data['name'], font=T.font(15), anchor='w',
@@ -102,7 +139,7 @@ class SoundRow(ctk.CTkFrame):
             fg_color=T.BLUE if spec else 'transparent',
             hover_color=T.BLUE_DARK if spec else T.SURFACE_3,
             border_width=0 if spec else 1, border_color=T.BORDER,
-            text_color='#FFFFFF' if spec else T.TEXT_DIM,
+            text_color=T.ON_ACCENT if spec else T.TEXT_DIM,
             command=lambda: app.set_hotkey(index))
         self.badge.pack(side='right', padx=6)
         self.badge.bind('<Button-3>', lambda e: app.clear_hotkey(index))
@@ -137,7 +174,7 @@ class DeviceRow:
             parent, variable=self.var, values=[NONE_LABEL], width=360, height=38,
             corner_radius=9, font=T.font(14), dropdown_font=T.font(14),
             fg_color=T.INPUT, button_color=T.INPUT, button_hover_color=T.SURFACE_3,
-            dropdown_fg_color=T.SURFACE_2, dropdown_hover_color=T.PURPLE_DARK,
+            dropdown_fg_color=T.SURFACE_2, dropdown_hover_color=T.SURFACE_3,
             text_color=T.TEXT, dropdown_text_color=T.TEXT, anchor='w',
             dynamic_resizing=False, command=lambda _v: on_pick())
         self.menu.grid(row=row, column=2, sticky='ew', padx=10, pady=7)
@@ -186,6 +223,8 @@ class DeviceRow:
 # --------------------------------------------------------------------------- app
 class App(ctk.CTk):
     def __init__(self):
+        T.apply(peek_theme())
+        ctk.set_appearance_mode(T.MODE)
         super().__init__(fg_color=T.BG)
         self.engine = ae.Engine()
         self.devices, self.inputs = [], []
@@ -273,7 +312,7 @@ class App(ctk.CTk):
         # ---- header
         head = ctk.CTkFrame(self, fg_color='transparent')
         head.grid(row=0, column=0, sticky='ew', padx=22, pady=(20, 10))
-        badge = ctk.CTkLabel(head, text='♪', font=T.font(26, 'bold'), text_color='#FFFFFF',
+        badge = ctk.CTkLabel(head, text='♪', font=T.font(26, 'bold'), text_color=T.ON_ACCENT,
                              fg_color=T.PURPLE, corner_radius=12, width=52, height=52)
         badge.pack(side='left')
         titles = ctk.CTkFrame(head, fg_color='transparent')
@@ -292,6 +331,9 @@ class App(ctk.CTk):
             fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
             command=lambda: self.check_update(quiet=False))
         self.btn_update.pack(side='right', padx=14)
+        ctk.CTkButton(head, text='🎨  ธีม', width=92, height=32, corner_radius=9, font=T.font(13),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=self.open_theme_picker).pack(side='right')
 
         # ---- devices card
         card = Card(self, 'อุปกรณ์เสียง')
@@ -381,7 +423,7 @@ class App(ctk.CTk):
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
-                          text_color='#FFFFFF' if fill != T.INPUT else T.TEXT,
+                          text_color=T.ON_ACCENT if fill != T.INPUT else T.TEXT,
                           command=cmd).pack(side='left', padx=(0, 10))
 
         self.status = ctk.CTkLabel(self, text='', font=T.font(13), text_color=T.TEXT_FAINT,
@@ -460,6 +502,7 @@ class App(ctk.CTk):
         return []
 
     def _update_banner(self, problems):
+        self._last_problems = list(problems)
         if problems:
             self.dot.configure(text_color=T.DANGER)
             self.head_status.configure(text='เปิดอุปกรณ์ไม่ได้', text_color=T.DANGER)
@@ -631,7 +674,7 @@ class App(ctk.CTk):
             self.save_config()
 
         ctk.CTkButton(win, text='บันทึก', width=150, height=38, corner_radius=9,
-                      font=T.font(14, 'bold'), fg_color=T.PURPLE, hover_color=T.PURPLE_DARK,
+                      font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PURPLE, hover_color=T.PURPLE_DARK,
                       command=ok).pack(pady=20)
         win.bind('<Return>', lambda e: ok())
 
@@ -846,12 +889,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(picker, text='เลือกเว็บ', font=T.font(13),
                      text_color=T.TEXT_FAINT).pack(side='left', padx=(2, 12))
         site_var = ctk.StringVar(value=src.SOURCES[0].label)
-        ctk.CTkSegmentedButton(
-            picker, values=[s.label for s in src.SOURCES], variable=site_var,
-            height=36, corner_radius=9, font=T.font(14, 'bold'),
-            fg_color=T.INPUT, selected_color=T.PURPLE, selected_hover_color=T.PURPLE_DARK,
-            unselected_color=T.INPUT, unselected_hover_color=T.SURFACE_3,
-            text_color=T.TEXT, command=lambda _v: on_site()).pack(side='left')
+        ToggleGroup(picker, [s.label for s in src.SOURCES], site_var,
+                    command=lambda _v: on_site()).pack(side='left')
 
         head = ctk.CTkFrame(win, fg_color='transparent')
         head.pack(fill='x', padx=20, pady=(12, 10))
@@ -915,7 +954,7 @@ class App(ctk.CTk):
                 ctk.CTkLabel(row, text=e['text'], font=T.font(14), text_color=T.TEXT,
                              anchor='w').pack(side='left', fill='x', expand=True)
                 ctk.CTkButton(row, text='⭳ โหลด', width=90, height=32, corner_radius=8,
-                              font=T.font(13, 'bold'), fg_color=T.PURPLE,
+                              font=T.font(13, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PURPLE,
                               hover_color=T.PURPLE_DARK,
                               command=partial(grab, e, source)).pack(side='right', padx=(4, 8))
                 ctk.CTkButton(row, text='▶', width=34, height=32, corner_radius=8,
@@ -996,10 +1035,84 @@ class App(ctk.CTk):
             threading.Thread(target=worker, daemon=True).start()
 
         ctk.CTkButton(head, text='ค้นหา', width=104, height=42, corner_radius=9,
-                      font=T.font(14, 'bold'), fg_color=T.PINK, hover_color=T.PINK_DARK,
+                      font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PINK, hover_color=T.PINK_DARK,
                       command=search).pack(side='left', padx=(10, 0))
         entry.bind('<Return>', search)
         set_note('▶ = ฟังตัวอย่างทางหูฟัง (ไม่เข้าเกม)   ⭳ = บันทึกลง sounds/ แล้วเพิ่มเข้ารายการ')
+
+    # ---------------------------------------------------------------- themes
+    def open_theme_picker(self):
+        win = self._dialog('เลือกธีม', 660, 500, modal=False)
+        ctk.CTkLabel(win, text='เลือกธีม', font=T.font(19, 'bold'),
+                     text_color=T.TEXT).pack(pady=(20, 2))
+        ctk.CTkLabel(win, text='กดที่การ์ดเพื่อเปลี่ยนทันที — จำไว้ให้ครั้งหน้า',
+                     font=T.font(13), text_color=T.TEXT_FAINT).pack(pady=(0, 12))
+        grid = ctk.CTkFrame(win, fg_color='transparent')
+        grid.pack(fill='both', expand=True, padx=18, pady=(0, 18))
+        grid.grid_columnconfigure((0, 1, 2), weight=1, uniform='theme')
+
+        for i, name in enumerate(T.NAMES):
+            pal = T.THEMES[name]
+            current = name == T.NAME
+            card = ctk.CTkFrame(grid, fg_color=pal['SURFACE'], corner_radius=12,
+                                border_width=3 if current else 1,
+                                border_color=pal['PURPLE'] if current else pal['BORDER'])
+            card.grid(row=i // 3, column=i % 3, padx=7, pady=7, sticky='nsew')
+            title = ctk.CTkLabel(card, text=name + ('   ✓' if current else ''),
+                                 font=T.font(15, 'bold'), text_color=pal['TEXT'])
+            title.pack(anchor='w', padx=14, pady=(12, 6))
+            dots = ctk.CTkFrame(card, fg_color='transparent')
+            dots.pack(anchor='w', padx=14)
+            swatches = [ctk.CTkFrame(dots, fg_color=pal[k], width=24, height=24, corner_radius=12)
+                        for k in ('PURPLE', 'PINK', 'BLUE')]
+            for s in swatches:
+                s.pack(side='left', padx=(0, 6))
+            mode = ctk.CTkLabel(card, text='โหมดสว่าง' if pal['MODE'] == 'light' else 'โหมดมืด',
+                                font=T.font(12), text_color=pal['TEXT_FAINT'])
+            mode.pack(anchor='w', padx=14, pady=(6, 12))
+            for w in (card, title, dots, mode, *swatches):
+                w.bind('<Button-1>', lambda _e, n=name: self.apply_theme(n))
+                try:
+                    w.configure(cursor='hand2')
+                except Exception:
+                    pass
+
+    def apply_theme(self, name):
+        if name == T.NAME:
+            return
+        T.apply(name)
+        ctk.set_appearance_mode(T.MODE)
+        self.config_data['theme'] = T.NAME
+        self.save_config()
+        # the click came from a widget that the rebuild destroys — let it return first
+        self.after(20, self.rebuild_ui)
+
+    def rebuild_ui(self):
+        """Recreate every widget in the new colours. Audio streams, hotkeys and the tray
+        are untouched, so a theme change never interrupts sound or the mic."""
+        self.capturing = False
+        for child in list(self.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        self._dl_win = None
+        self.rows = []
+        self.configure(fg_color=T.BG)
+        self._build()
+        self.dev_game.set_options(self.devices, False, self.config_data.get('game_device'))
+        self.dev_mon.set_options(self.devices, True, self.config_data.get('monitor_device'))
+        self.dev_mic.set_options(self.inputs, True, self.config_data.get('mic_device'))
+        self._restore_widgets()
+        for row in (self.dev_game, self.dev_mon, self.dev_mic):
+            row.refresh_pct()
+        if getattr(self, 'tray', None) is not None and not self.tray.available:
+            self.sw_tray.configure(state='disabled')
+            self.sw_tray.var.set(False)
+        self._update_banner(getattr(self, '_last_problems', []))
+        if getattr(self, '_pending_update', None):
+            self._show_update_button(self._pending_update)
+        self.say(f'เปลี่ยนเป็นธีม "{T.NAME}" แล้ว', T.OK)
 
     # ---------------------------------------------------------------- updates
     def check_update(self, quiet=True):
@@ -1033,12 +1146,16 @@ class App(ctk.CTk):
             if not quiet:
                 self.say(f'ใช้เวอร์ชันล่าสุดอยู่แล้ว (v{ver.VERSION})', T.OK)
             return
-        self.btn_update.configure(text=f"อัปเดต v{info['version']}", fg_color=T.PINK,
-                                  hover_color=T.PINK_DARK, text_color='#FFFFFF',
-                                  command=lambda: self.offer_update(info))
+        self._show_update_button(info)
         self.say(f"มีเวอร์ชันใหม่ v{info['version']} — กดปุ่มสีชมพูมุมขวาบนเพื่อติดตั้ง", T.OK)
         if getattr(self, 'tray', None) is not None and self.tray.available:
             self.tray.notify(f"SoundSaoTer มีเวอร์ชันใหม่ v{info['version']}")
+
+    def _show_update_button(self, info):
+        self._pending_update = info
+        self.btn_update.configure(text=f"อัปเดต v{info['version']}", fg_color=T.PINK,
+                                  hover_color=T.PINK_DARK, text_color=T.ON_ACCENT,
+                                  command=lambda: self.offer_update(info))
 
     def offer_update(self, info):
         win = self._dialog(f"อัปเดตเป็น v{info['version']}", 540, 340, modal=False)
@@ -1088,7 +1205,7 @@ class App(ctk.CTk):
             threading.Thread(target=worker, daemon=True).start()
 
         btn = ctk.CTkButton(win, text='ติดตั้งเลย', height=42, corner_radius=10,
-                            font=T.font(15, 'bold'), fg_color=T.PURPLE,
+                            font=T.font(15, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PURPLE,
                             hover_color=T.PURPLE_DARK, command=install)
         btn.pack(fill='x', padx=24, pady=(4, 18))
 
@@ -1108,11 +1225,17 @@ class App(ctk.CTk):
         self._scanned = self.scan_sounds_folder()
         if self._scanned:
             self.save_config()
+        self.config_data['theme'] = T.NAME
+        self._restore_widgets()
+
+    def _restore_widgets(self):
+        """Push the saved settings into freshly built widgets."""
         self.dev_game.vol.set(self.config_data['game_volume'])
         self.dev_mon.vol.set(self.config_data['monitor_volume'])
         self.dev_mic.vol.set(self.config_data['mic_volume'])
         self.sw_excl.var.set(self.config_data['exclusive'])
         self.sw_hk.var.set(self.config_data['hotkeys_enabled'])
+        self.sw_tray.var.set(bool(self.config_data.get('tray', True)))
         self.stop_badge.configure(text=self.config_data['stop_hotkey'] or 'ตั้งปุ่ม')
         self.var_hearself.set(bool(self.config_data.get('hear_self')))
         self.engine.set_monitor_self(self.var_hearself.get())   # applied when the mic starts
