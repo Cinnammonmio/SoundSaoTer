@@ -19,6 +19,8 @@ import version
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(HERE, 'dist', 'SoundSaoTer.exe')
 MANIFEST = os.path.join(HERE, 'dist', 'latest.json')
+EXTRAS = [os.path.join(HERE, 'vbcable', n) for n in sorted(os.listdir(os.path.join(HERE, 'vbcable')))
+          if n.lower().endswith('.zip')] if os.path.isdir(os.path.join(HERE, 'vbcable')) else []
 ASSET = 'SoundSaoTer.exe'
 
 
@@ -75,9 +77,9 @@ def main():
     exists = run(['gh', 'release', 'view', tag], cwd=HERE).returncode == 0
     if exists:
         print(f'มี {tag} อยู่แล้ว — อัปทับไฟล์เดิม')
-        out = run(['gh', 'release', 'upload', tag, EXE, MANIFEST, '--clobber'], cwd=HERE)
+        out = run(['gh', 'release', 'upload', tag, EXE, MANIFEST, *EXTRAS, '--clobber'], cwd=HERE)
     else:
-        out = run(['gh', 'release', 'create', tag, EXE, MANIFEST,
+        out = run(['gh', 'release', 'create', tag, EXE, MANIFEST, *EXTRAS,
                    '--title', f'SoundSaoTer {tag}', '--notes', notes_for(v)], cwd=HERE)
     if out.returncode != 0:
         raise SystemExit('ปล่อยเวอร์ชันไม่สำเร็จ:\n' + (out.stderr or out.stdout))
