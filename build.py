@@ -52,6 +52,10 @@ def main():
     if os.path.isfile(readme):
         shutil.copy2(readme, share)
     os.makedirs(os.path.join(share, 'sounds'), exist_ok=True)
+    # VB-CABLE แจกต่อได้แบบไฟล์ต้นฉบับเท่านั้น — ก๊อปทั้ง zip ไม่แตกไม่แก้
+    for name in os.listdir(os.path.join(HERE, 'vbcable')) if os.path.isdir(os.path.join(HERE, 'vbcable')) else []:
+        if name.lower().endswith('.zip'):
+            shutil.copy2(os.path.join(HERE, 'vbcable', name), share)
     print(f'โฟลเดอร์พร้อมส่ง: {share}')
     return 0
 
