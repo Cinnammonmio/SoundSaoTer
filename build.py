@@ -41,6 +41,9 @@ ARGS = [
     '--hidden-import', 'ytclip',
     '--add-binary', f"{os.path.join(HERE, 'vendor', 'rnnoise', 'rnnoise.dll')}{os.pathsep}rnnoise",   # mic noise suppression
     '--add-data', f"{os.path.join(HERE, 'vendor', 'rnnoise', 'COPYING-rnnoise.txt')}{os.pathsep}rnnoise",
+    '--collect-all', 'livekit.rtc',     # 🎚 echo cancelling: WebRTC AEC3 (livekit_ffi.dll + protobufs)
+    '--collect-all', 'soundcard',       # 🎚 echo cancelling: WASAPI loopback (+ its C header files)
+    '--hidden-import', 'micfx',
     os.path.join(HERE, 'soundboard.py'),
 ]
 

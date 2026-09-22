@@ -8,10 +8,13 @@
     auto volume         evens out quiet and loud speech; only adapts while you speak,
                         so it never pumps up the background
     limiter             soft ceiling, so boosted speech never clips
+    echo cancellation   WebRTC AEC3 (through LiveKit's WebRTC build): records what the
+                        speaker plays (WASAPI loopback) and subtracts its echo from
+                        the mic — for playing on speakers instead of a headset
 
 Everything runs at 48 kHz mono in 10 ms frames (RNNoise's native format) and adds
 one frame of latency (+ RNNoise's own 10 ms). RNNoise is loaded only while the
-suppressor or the gate is on — it is the one part that costs RAM (~20 MB).
+suppressor or the gate is on (~12 MB), the echo canceller only while it is on (~21 MB).
 
 Threading: the audio callback only calls process(). The RNNoise state is created
 and freed by attach()/detach(), which the engine calls while the mic stream is
@@ -107,6 +110,139 @@ class _Denoiser:
             _release()
 
 
+# ---------------------------------------------------------------- echo cancellation
+VIRTUAL_HINTS = ('cable', 'vb-audio', 'voicemeeter', 'virtual')
+
+
+def is_virtual(name):
+    low = (name or '').lower()
+    return any(h in low for h in VIRTUAL_HINTS)
+
+
+def speaker_names():
+    """Real output devices, as Windows names them (for the 'which speaker' menu)."""
+    import soundcard as sc
+    return [s.name for s in sc.all_speakers() if not is_virtual(s.name)]
+
+
+def pick_speaker(wanted='', hint=''):
+    """The speaker whose sound may leak into the mic. Never a virtual cable: its
+    loopback carries your own mic, and cancelling that would erase your voice."""
+    import soundcard as sc
+    speakers = [s for s in sc.all_speakers() if not is_virtual(s.name)]
+    if wanted:
+        for s in speakers:
+            if s.name == wanted:
+                return s
+    default = sc.default_speaker()
+    if default is not None and not is_virtual(default.name):
+        return default
+    if hint:                                        # the app's own "headphones" device
+        for s in speakers:
+            if s.name.lower().startswith(hint.lower()[:20]) or hint.lower().startswith(s.name.lower()[:20]):
+                return s
+    return speakers[0] if speakers else None
+
+
+class _EchoReference:
+    """Records what the speaker is playing (WASAPI loopback) on its own thread."""
+
+    def __init__(self, speaker):
+        import collections
+        import threading
+        self.name = speaker.name
+        self._speaker = speaker
+        self.frames = collections.deque(maxlen=50)   # 0.5 s of backlog at most
+        self._stop = threading.Event()
+        self.error = ''
+        self._thread = threading.Thread(target=self._run, name='echo-reference', daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        import warnings
+        import soundcard as sc
+        ctypes.windll.ole32.CoInitializeEx(None, 0)   # COM for this thread
+        # soundcard warns "data discontinuity" whenever nothing is playing; that is normal
+        warnings.filterwarnings('ignore', message='data discontinuity')
+        try:
+            mic = sc.get_microphone(id=str(self._speaker.name), include_loopback=True)
+            with mic.recorder(samplerate=RATE, channels=1, blocksize=FRAME) as rec:
+                while not self._stop.is_set():
+                    data = rec.record(numframes=FRAME)
+                    self.frames.append(np.ascontiguousarray(data[:, 0], dtype=np.float32))
+        except Exception as exc:                      # noqa: BLE001 — shown in the dialog
+            self.error = f'อ่านเสียงลำโพงไม่ได้: {exc}'
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
+class _EchoCanceller:
+    """WebRTC's echo canceller (AEC3, via LiveKit's build of WebRTC)."""
+
+    def __init__(self, speaker, denoise=False):
+        from livekit import rtc                       # heavy: imported only when switched on
+        self._rtc = rtc
+        # With echo cancelling on, noise is suppressed here (WebRTC NS) rather than by
+        # RNNoise: RNNoise mistakes AEC's leftovers for noise and, while you talk over
+        # the speakers, cuts your voice by 10-30 dB. WebRTC NS is built to follow AEC3.
+        self.apm = rtc.AudioProcessingModule(echo_cancellation=True, noise_suppression=denoise,
+                                             high_pass_filter=True)
+        self.ref = _EchoReference(speaker)
+
+    def _frame(self, samples):
+        pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16).tobytes()
+        return self._rtc.AudioFrame(pcm, RATE, 1, FRAME)
+
+    def process(self, frame):
+        refs = self.ref.frames
+        while refs:                                   # the speaker audio since the last mic frame
+            self.apm.process_reverse_stream(self._frame(refs.popleft()))
+        f = self._frame(frame)
+        self.apm.process_stream(f)
+        return np.frombuffer(f.data, np.int16).astype(np.float32) * (1 / 32767)
+
+    def close(self):
+        self.ref.close()
+        handle = getattr(self.apm, '_ffi_handle', None)
+        if handle is not None:
+            handle.dispose()
+
+
+def selftest(out_path):
+    """Load RNNoise, the echo canceller and the speaker loopback like the app does,
+    run a second of silence through them and write what happened (for bug reports)."""
+    import json
+    import time
+    report = {}
+    fx = MicProcessor()
+    fx.denoise = fx.gate = fx.agc = fx.aec = True
+    try:
+        t = time.perf_counter()
+        fx.attach()
+        report['attach_s'] = round(time.perf_counter() - t, 3)
+        report['rnnoise'] = fx._rnn is not None
+        report['aec'] = fx._aec is not None
+        report['speaker'] = fx.aec_name
+        report['error'] = fx.error
+        n = 0
+        for _ in range(100):
+            fx.process(np.zeros(FRAME, np.float32))
+            n += 1
+            time.sleep(0.01)
+        report['frames'] = n
+        report['loopback_frames_waiting'] = len(fx._aec.ref.frames) if fx._aec else None
+        report['loopback_error'] = fx.aec_error
+    except Exception as exc:                            # noqa: BLE001
+        report['exception'] = f'{type(exc).__name__}: {exc}'
+    finally:
+        fx.detach()
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=1)
+    return 0 if report.get('rnnoise') and report.get('aec') and not report.get('exception') else 1
+
+
 # ---------------------------------------------------------------- the processor
 class MicProcessor:
     """Settings are plain attributes the UI may flip at any time (except which of
@@ -117,7 +253,12 @@ class MicProcessor:
         self.gate = False
         self.sensitivity = 50        # 0 = only clear speech opens the gate, 100 = opens easily
         self.agc = False
+        self.aec = False
+        self.aec_device = ''         # '' = pick automatically
+        self.aec_hint = ''           # the app's headphone device, used if Windows' default is a cable
+        self.aec_name = ''           # the speaker actually used (for the dialog)
         self._rnn = None
+        self._aec = None
         self._reset()
 
     # what the UI shows
@@ -126,11 +267,19 @@ class MicProcessor:
 
     @property
     def needs_ai(self):
-        return self.denoise or self.gate
+        """RNNoise: for the gate's voice detection, and for suppression unless the echo
+        canceller does the suppression itself."""
+        return self.gate or (self.denoise and not self.aec)
 
     @property
     def active(self):
-        return self.denoise or self.gate or self.agc
+        return self.denoise or self.gate or self.agc or self.aec
+
+    @property
+    def loaded_parts(self):
+        """What must be (un)loaded with the mic stopped — the engine restarts the mic
+        when this changes."""
+        return (self.needs_ai, self.aec, (self.aec_device, self.denoise) if self.aec else None)
 
     def _reset(self):
         self._pending = np.zeros(0, np.float32)
@@ -152,13 +301,34 @@ class MicProcessor:
                 self._rnn = _Denoiser()
             except Exception as exc:        # noqa: BLE001 — shown in the settings dialog
                 self.error = f'โหลดตัวตัดเสียงรบกวนไม่ได้: {exc}'
-                self.denoise = self.gate = False
+                self.gate = False
+                if not self.aec:
+                    self.denoise = False
+        self.aec_name = ''
+        if self.aec and self._aec is None:
+            try:
+                speaker = pick_speaker(self.aec_device, self.aec_hint)
+                if speaker is None:
+                    raise RuntimeError('ไม่พบลำโพง/หูฟังจริงในเครื่อง')
+                self._aec = _EchoCanceller(speaker, denoise=self.denoise)
+                self.aec_name = speaker.name
+            except Exception as exc:        # noqa: BLE001
+                self.error = f'เปิดตัดเสียงสะท้อนไม่ได้: {exc}'
+                self.aec = False
 
     def detach(self):
-        """Mic stream is stopped: free RNNoise."""
+        """Mic stream is stopped: free RNNoise and the echo canceller."""
         rnn, self._rnn = self._rnn, None
         if rnn is not None:
             rnn.close()
+        aec, self._aec = self._aec, None
+        if aec is not None:
+            aec.close()
+
+    @property
+    def aec_error(self):
+        aec = self._aec
+        return aec.ref.error if aec is not None else ''
 
     @property
     def threshold(self):
@@ -180,11 +350,14 @@ class MicProcessor:
 
     def _frame(self, frame):
         self.level_in = max(float(np.abs(frame).max()), self.level_in * 0.8)
+        aec = self._aec
+        if aec is not None:                 # first: take the speaker's sound back out
+            frame = aec.process(frame)
         rnn = self._rnn
         vad = None
         if rnn is not None:
             cleaned, vad = rnn.process(frame)
-            y = cleaned if self.denoise else frame.copy()
+            y = cleaned if self.denoise and aec is None else frame.copy()
         else:
             y = frame.copy()
 

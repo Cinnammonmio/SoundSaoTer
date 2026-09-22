@@ -8,6 +8,11 @@ if len(sys.argv) > 1 and sys.argv[1] == '--yt-worker':
     import ytclip
     sys.exit(ytclip.worker_main(sys.argv[2:]))
 
+if len(sys.argv) > 1 and sys.argv[1] == '--micfx-selftest':
+    # diagnostics: load every voice-processing part the way the app would, write a report
+    import micfx
+    sys.exit(micfx.selftest(sys.argv[2] if len(sys.argv) > 2 else 'micfx-selftest.json'))
+
 
 import queue
 import tempfile
@@ -73,6 +78,7 @@ def default_config():
         'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
         'cache_mb': 40, 'slots': [], 'view': 'slots',
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
+        'mic_aec': False, 'mic_aec_device': '',
     }
 
 
@@ -1361,7 +1367,7 @@ class App(ctk.CTk):
     def _mic_fx_label(self):
         fx = self.engine.micfx
         on = [name for name, flag in (('ตัดเสียงรบกวน', fx.denoise), ('ตัดตอนไม่พูด', fx.gate),
-                                      ('ปรับดังอัตโนมัติ', fx.agc)) if flag]
+                                      ('ปรับดังอัตโนมัติ', fx.agc), ('ตัดเสียงสะท้อน', fx.aec)) if flag]
         return '🎚  ปรับเสียงไมค์' + (f' · เปิด {len(on)}' if on else '')
 
     def _refresh_mic_fx_button(self):
@@ -1382,7 +1388,7 @@ class App(ctk.CTk):
         import micfx
         fx = self.engine.micfx
         cfg = self.config_data
-        win = self._dialog('ปรับเสียงไมค์', 600, 650, modal=False)
+        win = self._dialog('ปรับเสียงไมค์', 600, 820, modal=False)
         self._fx_win = win
 
         ctk.CTkLabel(win, text='🎚  ปรับเสียงไมค์', font=T.font(18, 'bold'),
@@ -1407,7 +1413,8 @@ class App(ctk.CTk):
         ai_ok = micfx.available()
         _box, var_dn = card('ตัดเสียงรบกวน (AI)',
                             'ตัดเสียงพัดลม แอร์ คีย์บอร์ด เสียงรอบห้อง ให้เพื่อนได้ยินแต่เสียงพูด\n'
-                            'ใช้ RNNoise · แรมเพิ่ม ~12 MB เฉพาะตอนเปิด · หน่วงเพิ่ม ~20 ms',
+                            'ใช้ RNNoise · แรมเพิ่ม ~12 MB เฉพาะตอนเปิด · หน่วงเพิ่ม ~20 ms · ถ้าเปิดตัดเสียงสะท้อนด้วย '
+                            'จะสลับไปใช้ตัวตัดของ WebRTC (เบากว่า) ไม่ให้เสียงพูดหายตอนพูดทับเสียงลำโพง',
                             fx.denoise, lambda: changed())
         gate_box, var_gate = card('ตัดไมค์ตอนไม่ได้พูด',
                                   'ไมค์เงียบสนิทระหว่างที่ไม่ได้พูด — ใช้ AI ฟังว่าเป็นเสียงคน '
@@ -1427,6 +1434,29 @@ class App(ctk.CTk):
                              'พูดเบาก็ดังขึ้น ตะโกนก็ไม่แตก — ปรับเฉพาะตอนพูด ไม่ดันเสียงรบกวนขึ้นมา · '
                              'ได้ผลดีสุดเมื่อเปิด "ตัดเสียงรบกวน" ด้วย',
                              fx.agc, lambda: changed())
+        aec_box, var_aec = card('ตัดเสียงสะท้อนจากลำโพง',
+                                'ใช้ลำโพงแทนหูฟัง แล้วเพื่อนได้ยินเสียงเกม/เสียงเพื่อนย้อนกลับ — ตัวนี้ฟังว่าลำโพงเล่นอะไรอยู่ '
+                                'แล้วลบเสียงนั้นออกจากไมค์ (WebRTC AEC3 แบบเดียวกับ Chrome/Discord) · '
+                                'แรมเพิ่ม ~20 MB ตั้งแต่เปิดครั้งแรกจนปิดโปรแกรม · ใช้หูฟังอยู่ไม่ต้องเปิด',
+                                fx.aec, lambda: changed())
+        spk_row = ctk.CTkFrame(aec_box, fg_color='transparent')
+        spk_row.pack(fill='x', padx=16, pady=(0, 12))
+        ctk.CTkLabel(spk_row, text='ลำโพงที่ใช้', font=T.font(12), text_color=T.TEXT_DIM).pack(side='left')
+        AUTO = 'อัตโนมัติ (ลำโพงหลักของ Windows)'
+        try:
+            speakers = micfx.speaker_names()
+        except Exception:
+            speakers = []
+        spk_var = ctk.StringVar(value=fx.aec_device if fx.aec_device in speakers else AUTO)
+        spk_menu = ctk.CTkOptionMenu(
+            spk_row, variable=spk_var, values=[AUTO] + speakers, height=30, corner_radius=8,
+            font=T.font(12), dropdown_font=T.font(12), fg_color=T.INPUT, button_color=T.INPUT,
+            button_hover_color=T.SURFACE_3, dropdown_fg_color=T.SURFACE_2, dropdown_hover_color=T.SURFACE_3,
+            text_color=T.TEXT, dropdown_text_color=T.TEXT, dynamic_resizing=False, width=330,
+            command=lambda _v: speaker_changed())
+        spk_menu.pack(side='left', padx=(10, 0))
+        spk_used = ctk.CTkLabel(aec_box, text='', font=T.font(11), text_color=T.TEXT_FAINT, anchor='w')
+        spk_used.pack(fill='x', padx=16, pady=(0, 10))
 
         # ---- live meters
         live = ctk.CTkFrame(win, fg_color=T.SURFACE_2, corner_radius=12)
@@ -1456,8 +1486,7 @@ class App(ctk.CTk):
         note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
                             anchor='w', wraplength=540)
         note.pack(fill='x', padx=24, pady=(8, 14))
-        default_note = ('ยังไม่มีตัดเสียงสะท้อนจากลำโพง — ถ้าเพื่อนได้ยินเสียงเกมหรือเสียงตัวเองย้อนกลับ '
-                        'ให้ใช้หูฟังแทนลำโพง')
+        default_note = 'ใช้หูฟังอยู่ไม่ต้องเปิดตัดเสียงสะท้อน — เปิดเฉพาะตอนเล่นกับลำโพง'
 
         def set_note(text=None, tone=None):
             note.configure(text=text or default_note, text_color=tone or T.TEXT_FAINT)
@@ -1466,8 +1495,10 @@ class App(ctk.CTk):
             var_dn.set(fx.denoise)
             var_gate.set(fx.gate)
             var_agc.set(fx.agc)
+            var_aec.set(fx.aec)
             state = 'normal' if fx.gate else 'disabled'
             sens.configure(state=state, button_color=T.PURPLE if fx.gate else T.SURFACE_3)
+            spk_used.configure(text=f'กำลังฟังจาก: {fx.aec_name}' if fx.aec and fx.aec_name else '')
             self._refresh_mic_fx_button()
 
         def changed():
@@ -1475,14 +1506,26 @@ class App(ctk.CTk):
                 var_dn.set(False)
                 var_gate.set(False)
                 set_note('ไม่พบไฟล์ตัวตัดเสียงรบกวน (rnnoise.dll) — ลองโหลดโปรแกรมใหม่', T.DANGER)
-            self.engine.set_mic_fx(denoise=var_dn.get(), gate=var_gate.get(), agc=var_agc.get())
+            self.engine.set_mic_fx(denoise=var_dn.get(), gate=var_gate.get(), agc=var_agc.get(),
+                                   aec=var_aec.get())
             if fx.error:
                 set_note(fx.error, T.DANGER)
             elif self.engine.mic is None and fx.active:
                 set_note('ยังไม่ได้เลือก "ไมค์จริง" ในหน้าหลัก — ตั้งแล้วจะเริ่มทำงานเอง', T.WARN)
+            elif fx.aec and self.var_hearself.get():
+                set_note('ตอนเปิดตัดเสียงสะท้อน แนะนำปิด "ฟังเสียงตัวเอง" — เสียงตัวเองที่ออกลำโพง '
+                         'จะไปกวนตัวตัดเสียงสะท้อน', T.WARN)
             else:
                 set_note()
-            cfg.update(mic_denoise=fx.denoise, mic_gate=fx.gate, mic_agc=fx.agc)
+            cfg.update(mic_denoise=fx.denoise, mic_gate=fx.gate, mic_agc=fx.agc, mic_aec=fx.aec)
+            self.save_config()
+            sync()
+
+        def speaker_changed():
+            choice = spk_var.get()
+            device = '' if choice == AUTO else choice
+            self.engine.set_mic_fx(aec_device=device)
+            cfg['mic_aec_device'] = device
             self.save_config()
             sync()
 
@@ -1522,6 +1565,8 @@ class App(ctk.CTk):
                                    text_color=T.OK if fx.speaking else T.TEXT_FAINT)
                 else:
                     talk.configure(text='')
+                if fx.aec_error and note.cget('text') != fx.aec_error:
+                    set_note(fx.aec_error, T.DANGER)
             win.after(60, tick)
 
         sync()
@@ -2615,6 +2660,8 @@ class App(ctk.CTk):
         fx.gate = bool(self.config_data.get('mic_gate'))
         fx.sensitivity = float(self.config_data.get('mic_gate_sens', 50))
         fx.agc = bool(self.config_data.get('mic_agc'))
+        fx.aec = bool(self.config_data.get('mic_aec'))
+        fx.aec_device = self.config_data.get('mic_aec_device') or ''
         self._refresh_mic_fx_button()
         self.engine.exclusive = self.config_data['exclusive']
         self.view_var.set('📚  คลังเสียง' if self.config_data.get('view') == 'library' else '🎯  ช่องคีย์ลัด')

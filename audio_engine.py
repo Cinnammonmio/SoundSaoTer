@@ -411,6 +411,7 @@ class Engine:
             return None
         sink.live_gain = self.mic_gain
         monitor = self.players.get('monitor')
+        self.micfx.aec_hint = monitor.name if monitor is not None else ''
         self.mic = MicInput(self.mic_device, sink, monitor, self.micfx)
         self.mic.monitor_on = self.monitor_self
         return self.mic
@@ -432,26 +433,25 @@ class Engine:
         self.mic_device = device_index
         return self._start_mic()
 
-    def set_mic_fx(self, denoise=None, gate=None, sensitivity=None, agc=None):
-        """Change voice processing live. Turning RNNoise on or off restarts the mic
-        stream (~0.1 s), so the model is never loaded or freed under the callback."""
+    def set_mic_fx(self, denoise=None, gate=None, sensitivity=None, agc=None,
+                   aec=None, aec_device=None):
+        """Change voice processing live. Loading or unloading RNNoise or the echo
+        canceller restarts the mic stream (~0.1 s), so they are never swapped under
+        the audio callback."""
         fx = self.micfx
-        before = fx.needs_ai
-        after = (fx.denoise if denoise is None else bool(denoise)) or (fx.gate if gate is None else bool(gate))
-        restart = before != after and self.mic is not None
-        muted = restart and self.mic.muted
-        if restart:
-            self._stop_mic()
-        if denoise is not None:
-            fx.denoise = bool(denoise)
-        if gate is not None:
-            fx.gate = bool(gate)
+        before = fx.loaded_parts
+        for name, value in (('denoise', denoise), ('gate', gate), ('agc', agc), ('aec', aec)):
+            if value is not None:
+                setattr(fx, name, bool(value))
         if sensitivity is not None:
             fx.sensitivity = float(sensitivity)
-        if agc is not None:
-            fx.agc = bool(agc)
-        if restart and self._start_mic() is not None:
-            self.mic.muted = muted          # a restart must not un-mute the mic
+        if aec_device is not None:
+            fx.aec_device = aec_device
+        if fx.loaded_parts != before and self.mic is not None:
+            muted = self.mic.muted
+            self._stop_mic()
+            if self._start_mic() is not None:
+                self.mic.muted = muted      # a restart must not un-mute the mic
 
     def set_mic_gain(self, gain):
         self.mic_gain = float(gain)
