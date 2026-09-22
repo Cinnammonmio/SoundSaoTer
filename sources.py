@@ -186,39 +186,43 @@ class Robots:
 
 
 class TiengDong(Source):
-    """tiengdong.com — its robots.txt forbids automated site search, so this source
-    only reads what it allows: the latest-sounds pages and the category (tag) pages.
-    Filtering by name happens here, on the pages already loaded."""
+    """tiengdong.com/th (Thai section) — its robots.txt forbids automated site search
+    and the paged "latest" list, so this source only reads what it allows: the category
+    pages and each sound's own page. Filtering by name happens here, on pages already
+    loaded. Thai list pages carry no mp3 link, so resolve() opens the sound's page
+    (once, cached) right before a preview or download."""
 
     key = 'tiengdong'
     label = 'TiengDong'
-    hint = 'เลือกหมวดด้านขวา แล้วพิมพ์เพื่อกรอง (ไม่ต้องใส่วรรณยุกต์) หรือวางลิงก์หน้าเสียงของเว็บ'
-    BASE = 'https://tiengdong.com'
-    PAGES = 3                      # หน้าละ ~60 เสียง (หน้าแรกซ้ำกับหน้า 2 ราว 40 ตัว)
+    hint = 'เลือกหมวดด้านขวา แล้วพิมพ์เพื่อกรอง หรือวางลิงก์หน้าเสียงของเว็บ'
+    ROOT = 'https://tiengdong.com'
+    BASE = ROOT + '/th'
+    PAGES = 3                      # หน้าละ ~20-60 เสียง
     DELAY = 0.6                    # เว้นจังหวะระหว่างหน้า ไม่รัวเซิร์ฟเวอร์เขา
     CATEGORIES = [
-        ('ล่าสุด', ''),
-        ('มีม', 'am-thanh-meme'),
-        ('มีม (อังกฤษ)', 'meme-sound-effects'),
-        ('ตลก ขำขัน', 'vui-nhon-hai-huoc'),
-        ('เสียงหัวเราะ', 'tieng-cuoi'),
-        ('ประโยคไวรัล', 'cau-noi-viral'),
-        ('ตกใจ งง', 'bat-ngo-ngac-nhien'),
-        ('ลุ้นระทึก', 'cang-thang-hoi-hop'),
-        ('สยองขวัญ', 'am-thanh-kinh-di'),
-        ('การ์ตูน', 'am-thanh-hoat-hinh'),
-        ('ต่อสู้', 'am-thanh-danh-nhau'),
-        ('ปืน', 'tieng-sung'),
-        ('กิน ดื่ม', 'tieng-an-uong'),
-        ('ในครัว', 'tieng-trong-nha-bep'),
-        ('เอฟเฟกต์ทั่วไป', 'sound-effect'),
-        ('ริงโทน', 'nhac-chuong'),
-        ('เพลงประกอบ', 'nhac-nen-video'),
+        ('หน้าแรก', ''),              # หน้าเดียว — /th/page/* ห้ามตาม robots.txt
+        ('เสียงมีมไทย', 'th-meme-sound-effects'),
+        ('เสียงแนวโน้ม', 'th-viral-sound-effects'),
+        ('เสียงหัวเราะ', 'th-laugh-sound-effects'),
+        ('เสียงน้าค่อม', 'tag/th-kom-chauncheun-sound-effects'),
+        ('เอฟเฟกต์ streamer', 'tag/th-streamer-sound-effects'),
+        ('เสียงประกอบ', 'th-sound-effects'),
+        ('เสียงต่อสู้ อาวุธ', 'th-fighting-weapons-sound-effects'),
+        ('เสียงปืน', 'tag/th-gun-sound-effects'),
+        ('เสียงสยองขวัญ', 'th-horror-ferocious-sound-effects'),
+        ('เสียงสัตว์', 'th-animal-sound-effects'),
+        ('เสียงแมวร้อง', 'tag/th-cat-meow-sound-effects'),
+        ('เสียงการจราจร', 'th-vehicle-sound-effects'),
+        ('ระฆัง นกหวีด', 'th-bells-whistles-sound-effects'),
+        ('เสียงแจ้งเตือน', 'tag/th-notification-sounds'),
+        ('เสียงเรียกเข้า', 'th-ringtones'),
+        ('ริงโทนพี่เอก (HRK)', 'tag/th-hrk-ringtones'),
     ]
+    # รายการในหน้าหมวด (ภาษาไทย): มีแค่ชื่อกับลิงก์หน้าเสียง ไม่มีลิงก์ mp3
     ITEM_RE = re.compile(
-        r'data-post-id="(?P<id>\d+)"[^>]*?onclick="playPauseAudio\(\'[^\']*\',\s*\'(?P<url>[^\']+?\.mp3)\'\)'
-        r'[\s\S]*?<a href="(?P<page>[^"]+)"[^>]*>\s*(?P<name>[^<]+?)\s*</a>')
-    # หน้าของเสียงแต่ละตัว: เสียงหลักอยู่ในเครื่องเล่น <audio> ไม่ได้อยู่ในรายการ
+        r'<li class="audio-play-item">[\s\S]*?<a href="(?P<page>https://tiengdong\.com/th/th(?P<id>\d+))/?"[^>]*>'
+        r'\s*(?P<name>[^<]+?)\s*</a>')
+    # หน้าของเสียงแต่ละตัว: เสียงหลักอยู่ในเครื่องเล่น <audio>
     MAIN_RE = re.compile(r'<audio[^>]*id="audio-(?P<id>\d+)-[^"]*"[\s\S]*?<source[^>]*src="(?P<url>[^"?]+\.mp3)')
     H1_RE = re.compile(r'<h1[^>]*>([\s\S]*?)</h1>')
 
@@ -230,11 +234,11 @@ class TiengDong(Source):
     # -- polite, robots-aware fetching --
     def robots(self):
         if self._robots is None:
-            self._robots = Robots(fetch(self.BASE + '/robots.txt'))
+            self._robots = Robots(fetch(self.ROOT + '/robots.txt'))
         return self._robots
 
     def _get(self, url):
-        if not url.startswith(self.BASE):
+        if not url.startswith(self.ROOT):
             raise ValueError('ลิงก์นี้ไม่ใช่ของ tiengdong.com')
         if not self.robots().allowed(url):
             raise PermissionError('เว็บนี้ไม่อนุญาตให้โปรแกรมเปิดหน้านี้ (robots.txt) — '
@@ -254,17 +258,16 @@ class TiengDong(Source):
             out.append({'id': 'td' + main.group('id'), 'text': html_mod.unescape(name).strip(),
                         'creator': 'tiengdong', 'url': main.group('url'), 'page': ''})
         for m in self.ITEM_RE.finditer(page):
-            url = m.group('url')
             out.append({'id': 'td' + m.group('id'),
                         'text': html_mod.unescape(m.group('name')).strip(),
-                        'creator': 'tiengdong',
-                        'url': url if url.startswith('http') else self.BASE + url,
-                        'page': m.group('page')})
+                        'creator': 'tiengdong', 'url': '', 'page': m.group('page')})
         return out
 
     def category_urls(self, label):
         slug = dict(self.CATEGORIES).get(label, '')
-        root = f'{self.BASE}/tag/{slug}' if slug else self.BASE
+        if not slug:
+            return [self.BASE + '/']
+        root = f'{self.BASE}/{slug}'
         return [root] + [f'{root}/page/{n}' for n in range(2, self.PAGES + 1)]
 
     def load_category(self, label=None):
@@ -280,6 +283,15 @@ class TiengDong(Source):
                 break
             entries += found
         return MyInstants._dedupe(entries)
+
+    def resolve(self, entry):
+        """Fill entry['url'] from the sound's own page (list pages have no mp3 link)."""
+        if not entry.get('url'):
+            found = [e for e in self._get(entry['page']) if not e['page']]
+            if not found:
+                raise ValueError('หาไฟล์เสียงในหน้านี้ไม่เจอ')
+            entry['url'] = found[0]['url']
+        return entry
 
     def search_url(self, query):
         """For the 'open in browser' button — a person searching is fine, a bot is not."""
@@ -318,7 +330,9 @@ def download(entry, out_dir, source=None, on_progress=None):
     on_progress(done_bytes, total_bytes) is called as it streams; total is 0 when
     the server does not send a Content-Length.
     """
-    source = source or BY_LABEL.get(entry.get('creator')) or SOURCES[0]
+    source = source or BY_KEY.get(entry.get('creator')) or BY_LABEL.get(entry.get('creator')) or SOURCES[0]
+    if not entry.get('url') and hasattr(source, 'resolve'):
+        source.resolve(entry)       # TiengDong: เปิดหน้าเสียงหาลิงก์ mp3 ตอนจะใช้จริงเท่านั้น
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, source.filename(entry))
     if os.path.exists(path):
