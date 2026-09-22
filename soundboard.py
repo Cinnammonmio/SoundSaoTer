@@ -75,6 +75,47 @@ def default_config():
     }
 
 
+EDIT_KEYS = {86: '<<Paste>>', 67: '<<Copy>>', 88: '<<Cut>>', 65: '<<SelectAll>>'}   # physical V C X A
+
+
+def install_edit_keys(root):
+    """Ctrl+V/C/X/A and a right-click menu for every text box.
+
+    Tk matches Ctrl+V by the typed character. On the Thai keyboard layout that key
+    types "อ", so Ctrl+V did nothing — pasting a link was impossible unless the user
+    first switched to English. Match the physical key instead.
+    """
+    def on_ctrl_key(event):
+        if not event.state & 0x4 or event.keysym.lower() in ('v', 'c', 'x', 'a'):
+            return None                     # English layout: Tk's own bindings handle it
+        action = EDIT_KEYS.get(event.keycode)
+        if action is None:
+            return None
+        event.widget.event_generate(action)
+        return 'break'
+
+    def do(widget, action):
+        widget.focus_set()
+        # CTkEntry clears its placeholder on <FocusIn>; let that run before pasting
+        widget.after(30, lambda: widget.winfo_exists() and widget.event_generate(action))
+
+    def on_right_click(event):
+        widget = event.widget
+        menu = tk.Menu(widget, tearoff=0, font=(T.FONT, 11), bg=T.SURFACE_2, fg=T.TEXT,
+                       activebackground=T.PURPLE, activeforeground=T.ON_ACCENT, bd=0)
+        for label, action in (('วาง', '<<Paste>>'), ('คัดลอก', '<<Copy>>'),
+                              ('ตัด', '<<Cut>>'), ('เลือกทั้งหมด', '<<SelectAll>>')):
+            menu.add_command(label=label, command=lambda a=action: do(widget, a))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    root.bind_class('Entry', '<Control-KeyPress>', on_ctrl_key, add='+')
+    root.bind_class('Entry', '<Button-3>', on_right_click, add='+')
+
+
 def watch_text(entry, callback):
     """Call back on every change to the text — typing, pasting with the mouse, anything.
 
@@ -323,6 +364,7 @@ class App(ctk.CTk):
         T.apply(*peek_theme())
         ctk.set_appearance_mode(T.MODE)
         super().__init__(fg_color=T.BG)
+        install_edit_keys(self)
         self.engine = ae.Engine()
         self.devices, self.inputs = [], []
         self.config_data = default_config()
