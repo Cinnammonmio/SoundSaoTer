@@ -79,6 +79,7 @@ def default_config():
         'cache_mb': 40, 'slots': [], 'view': 'slots',
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
+        'remote_enabled': False, 'remote_key': '', 'remote_port': 8765,
     }
 
 
@@ -401,6 +402,11 @@ class App(ctk.CTk):
         self.load_config()
         self.refresh_devices(initial=True)
         self.apply_hotkeys()
+        if self.config_data.get('remote_enabled'):
+            try:
+                self._start_remote()
+            except Exception as exc:
+                self.say(f'เปิดการเชื่อมต่อมือถือไม่ได้: {exc}', T.WARN)
         if getattr(self, '_scanned', 0):
             self.say(f'พบไฟล์ใหม่ในโฟลเดอร์ sounds {self._scanned} ไฟล์ — เพิ่มเข้ารายการให้แล้ว', T.OK)
         self._start_tray()
@@ -548,6 +554,9 @@ class App(ctk.CTk):
             border_color=T.BORDER, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
             command=self.set_stop_hotkey)
         self.stop_badge.pack(side='right', padx=8)
+        ctk.CTkButton(top, text='📱  มือถือ', width=104, height=36, corner_radius=9, font=T.font(14),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=self.open_remote).pack(side='right', padx=(0, 4))
 
         tabs = ctk.CTkFrame(bar, fg_color='transparent')
         tabs.grid(row=1, column=0, sticky='ew', pady=(0, 8))
@@ -1372,13 +1381,210 @@ class App(ctk.CTk):
                     self.play_random(from_hotkey=True)
                 elif evt[0] == 'stop':
                     self.stop_all()
+                elif evt[0] == 'mute':          # from the phone remote
+                    self.sw_mute.var.set(evt[1])
+                    self.apply_mic_mute()
         except queue.Empty:
             pass
+        if getattr(self, 'remote', None) is not None:
+            self._remote_ticks = getattr(self, '_remote_ticks', 0) + 1
+            if self._remote_ticks % 12 == 0:    # ~1 s: fresh slots / sounds / mute for the phone
+                self._build_remote_snapshot()
         try:
             self.meter.set(min(1.0, self.engine.mic_peak() * 1.4))
         except Exception:
             pass
         self.after(80, self._tick)
+
+    # ---------------------------------------------------------------- phone remote
+    def _remote_css(self):
+        pairs = (('bg', T.BG), ('surface', T.SURFACE), ('surface3', T.SURFACE_3), ('input', T.INPUT),
+                 ('border', T.BORDER), ('text', T.TEXT), ('dim', T.TEXT_DIM), ('faint', T.TEXT_FAINT),
+                 ('accent', T.PURPLE), ('accent2', T.PINK), ('on', T.ON_ACCENT), ('ok', T.OK),
+                 ('warn', T.WARN), ('danger', T.DANGER))
+        return ''.join(f'--{k}:{v};' for k, v in pairs)
+
+    def _build_remote_snapshot(self):
+        """Runs on the Tk thread; the server thread only ever reads the finished dict."""
+        import hashlib
+
+        def label(name):
+            # the phone has little room: drop the file-id tags ("[522286]", "401945 - ")
+            return re.sub(r'\s*\[[^\]]+\]$', '', re.sub(r'^\d+ - ', '', name)).strip() or name
+
+        rows = self._rows()
+        ids = {}
+        sounds = []
+        for s in rows:
+            sid = hashlib.md5(self._key(s['path']).encode('utf-8')).hexdigest()[:10]
+            ids[sid] = s['path']
+            sounds.append({'id': sid, 'name': label(s['name']), 'src': self._source_of(s)})
+        by_key = {self._key(p): i for i, p in ids.items()}
+        slots = [{'n': 1, 'random': True, 'hotkey': self.config_data.get('random_hotkey', '')}]
+        for n, slot in enumerate(self.config_data['slots'], start=2):
+            sound = self.sound_by_path(slot.get('path'))
+            slots.append({'n': n, 'hotkey': slot.get('hotkey', ''),
+                          'id': by_key.get(self._key(sound['path'])) if sound else None,
+                          'name': label(sound['name']) if sound else ''})
+        mic = self.engine.mic
+        self._remote_snap = {
+            'slots': slots, 'sounds': sounds, 'paths': ids,
+            'muted': bool(mic.muted) if mic is not None else bool(self.sw_mute.var.get()),
+            'status': self.head_status.cget('text'), 'css': self._remote_css(),
+        }
+
+    def _start_remote(self):
+        import remote as rm
+        if getattr(self, 'remote', None) is not None and self.remote.running:
+            return self.remote
+        if not self.config_data.get('remote_key'):
+            self.config_data['remote_key'] = rm.new_key()
+            self.save_config()
+        self._build_remote_snapshot()
+        server = rm.RemoteServer(self.events, lambda: self._remote_snap, self.config_data['remote_key'],
+                                 int(self.config_data.get('remote_port') or rm.DEFAULT_PORT),
+                                 cooldown_left=self._cooldown_left)
+        server.start()
+        self.remote = server
+        return server
+
+    def _stop_remote(self):
+        server, self.remote = getattr(self, 'remote', None), None
+        if server is not None:
+            server.stop()
+
+    def open_remote(self):
+        existing = getattr(self, '_remote_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import io
+        import remote as rm
+        from PIL import Image
+        cfg = self.config_data
+        win = self._dialog('ใช้มือถือกดเสียง', 520, 700, modal=False)
+        self._remote_win = win
+
+        ctk.CTkLabel(win, text='📱  ใช้มือถือกดเสียง', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(18, 0))
+        ctk.CTkLabel(win, text='มือถือกับคอมต้องต่อ Wi-Fi วงเดียวกัน · ไม่ต้องลงแอป ใช้เบราว์เซอร์ในมือถือ',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(anchor='w', padx=24, pady=(2, 12))
+
+        head = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12, border_width=1, border_color=T.BORDER)
+        head.pack(fill='x', padx=20)
+        ctk.CTkLabel(head, text='เปิดให้มือถือเชื่อมต่อ', font=T.font(15, 'bold'),
+                     text_color=T.TEXT).pack(side='left', padx=16, pady=14)
+        var_on = ctk.BooleanVar(value=bool(getattr(self, 'remote', None)))
+        ctk.CTkSwitch(head, text='', variable=var_on, command=lambda: toggled(), width=44, switch_width=44,
+                      switch_height=22, progress_color=T.PURPLE, fg_color=T.INPUT, button_color=T.TEXT,
+                      button_hover_color=T.PINK).pack(side='right', padx=16)
+
+        body = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12, border_width=1, border_color=T.BORDER)
+        body.pack(fill='x', padx=20, pady=10)
+        qr_label = ctk.CTkLabel(body, text='', width=280, height=280, fg_color=T.SURFACE_2, corner_radius=12,
+                                text_color=T.TEXT_FAINT, font=T.font(13))
+        qr_label.pack(pady=(18, 8))
+        ctk.CTkLabel(body, text='สแกนด้วยกล้องมือถือ แล้วกดลิงก์ที่ขึ้นมา', font=T.font(13),
+                     text_color=T.TEXT_DIM).pack()
+        url_row = ctk.CTkFrame(body, fg_color='transparent')
+        url_row.pack(fill='x', padx=16, pady=(10, 16))
+        url_ent = ctk.CTkEntry(url_row, height=34, corner_radius=8, font=T.font(12), fg_color=T.INPUT,
+                               border_color=T.BORDER, text_color=T.TEXT_DIM)
+        url_ent.pack(side='left', fill='x', expand=True)
+        copy_btn = ctk.CTkButton(url_row, text='คัดลอก', width=70, height=34, corner_radius=8, font=T.font(12),
+                                 fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                                 command=lambda: copy())
+        copy_btn.pack(side='left', padx=(8, 0))
+
+        foot = ctk.CTkFrame(win, fg_color='transparent')
+        foot.pack(fill='x', padx=22)
+        phones = ctk.CTkLabel(foot, text='', font=T.font(13, 'bold'), text_color=T.TEXT_FAINT)
+        phones.pack(side='left')
+        ctk.CTkButton(foot, text='เปลี่ยนรหัสใหม่', width=120, height=32, corner_radius=8, font=T.font(12),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: new_key()).pack(side='right')
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
+                            anchor='w', wraplength=470)
+        note.pack(fill='x', padx=24, pady=(12, 14))
+        default_note = ('• ครั้งแรก Windows อาจถามเรื่องไฟร์วอลล์ — ติ๊ก "Private network" แล้วกด Allow\n'
+                        '• ใครมี QR นี้กดเสียงได้ ถ้าเผลอส่งให้คนอื่น กด "เปลี่ยนรหัสใหม่"\n'
+                        '• กดจากมือถือนับกันสแปมเหมือนคีย์ลัด · ไม่ได้ใช้ก็ปิดสวิตช์ไว้')
+
+        def show_qr(url):
+            buf = io.BytesIO()
+            import segno
+            segno.make(url, error='m').save(buf, kind='png', scale=7, border=2,
+                                             dark='#111111', light='#FFFFFF')
+            buf.seek(0)
+            img = Image.open(buf).convert('RGB')
+            photo = ctk.CTkImage(light_image=img, dark_image=img, size=(260, 260))
+            qr_label.configure(image=photo, text='')
+            qr_label._qr = photo
+
+        def refresh():
+            server = getattr(self, 'remote', None)
+            url_ent.configure(state='normal')
+            url_ent.delete(0, 'end')
+            if server is not None and server.running:
+                url = server.url()
+                url_ent.insert(0, url)
+                show_qr(url)
+                copy_btn.configure(state='normal')
+                if url.startswith('http://127.'):
+                    note.configure(text='หา IP ในวง Wi-Fi ไม่เจอ — คอมต่อเน็ตอยู่หรือเปล่า', text_color=T.WARN)
+                else:
+                    note.configure(text=default_note, text_color=T.TEXT_FAINT)
+            else:
+                qr_label.configure(image=None, text='เปิดสวิตช์ด้านบน\nแล้ว QR จะขึ้นตรงนี้')
+                qr_label._qr = None
+                copy_btn.configure(state='disabled')
+                note.configure(text=default_note, text_color=T.TEXT_FAINT)
+            url_ent.configure(state='readonly')
+
+        def toggled():
+            if var_on.get():
+                try:
+                    server = self._start_remote()
+                    self.say(f'เปิดให้มือถือกดเสียงแล้ว (พอร์ต {server.port})', T.OK)
+                except Exception as exc:
+                    var_on.set(False)
+                    note.configure(text=f'เปิดไม่ได้: {exc}', text_color=T.DANGER)
+                    return
+            else:
+                self._stop_remote()
+                self.say('ปิดการเชื่อมต่อมือถือแล้ว')
+            cfg['remote_enabled'] = bool(var_on.get())
+            self.save_config()
+            refresh()
+
+        def new_key():
+            cfg['remote_key'] = rm.new_key()
+            self.save_config()
+            if getattr(self, 'remote', None) is not None:
+                self._stop_remote()
+                self._start_remote()
+            refresh()
+            self.say('เปลี่ยนรหัสแล้ว — มือถือเครื่องเดิมต้องสแกน QR ใหม่', T.OK)
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(url_ent.get())
+            copy_btn.configure(text='✓')
+            win.after(1200, lambda: copy_btn.winfo_exists() and copy_btn.configure(text='คัดลอก'))
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            server = getattr(self, 'remote', None)
+            n = server.connected() if server is not None else 0
+            phones.configure(text=f'● มือถือต่ออยู่ {n} เครื่อง' if n else ('○ รอมือถือสแกน' if server else ''),
+                             text_color=T.OK if n else T.TEXT_FAINT)
+            win.after(1000, tick)
+
+        refresh()
+        tick()
 
     # ---------------------------------------------------------------- mic voice processing
     def _mic_fx_label(self):
@@ -2705,6 +2911,7 @@ class App(ctk.CTk):
                 pass
         if 'ytclip' in sys.modules:
             sys.modules['ytclip'].kill_all()
+        self._stop_remote()
         self.save_config()
         self.engine.close()
         self.destroy()

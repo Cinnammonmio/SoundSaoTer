@@ -44,6 +44,8 @@ ARGS = [
     '--collect-all', 'livekit.rtc',     # 🎚 echo cancelling: WebRTC AEC3 (livekit_ffi.dll + protobufs)
     '--collect-all', 'soundcard',       # 🎚 echo cancelling: WASAPI loopback (+ its C header files)
     '--hidden-import', 'micfx',
+    '--hidden-import', 'remote',        # 📱 phone remote (stdlib web server)
+    '--collect-submodules', 'segno',    # 📱 QR code
     os.path.join(HERE, 'soundboard.py'),
 ]
 
