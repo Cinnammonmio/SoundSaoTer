@@ -587,23 +587,40 @@ class App(ctk.CTk):
                           text_color=T.ON_ACCENT if fill != T.INPUT else T.TEXT,
                           command=cmd).pack(side='left', padx=(0, 10))
 
-        bottom = ctk.CTkFrame(self, fg_color='transparent')
-        bottom.grid(row=4, column=0, sticky='ew', padx=22, pady=(2, 12))
-        self.dot = ctk.CTkLabel(bottom, text='●', font=T.font(15), text_color=T.WARN)
-        self.dot.pack(side='right', padx=(6, 2))
-        self.head_status = ctk.CTkLabel(bottom, text='', font=T.font(13), text_color=T.TEXT_DIM)
-        self.head_status.pack(side='right')
-        self.btn_update = ctk.CTkButton(
-            bottom, text='ตรวจอัปเดต', width=108, height=30, corner_radius=8, font=T.font(12),
-            fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
-            command=lambda: self.check_update(quiet=False))
-        self.btn_update.pack(side='right', padx=(0, 14))
-        ctk.CTkButton(bottom, text='⚙  ตั้งค่า', width=96, height=30, corner_radius=8, font=T.font(12),
-                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
-                      command=self.open_settings).pack(side='right', padx=(0, 8))
-        self.status = ctk.CTkLabel(bottom, text='', font=T.font(13), text_color=T.TEXT_FAINT,
+        # ---- status bar: message on the left, settings / update / readiness on the right
+        bottom = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=12, height=48,
+                              border_width=1, border_color=T.BORDER)
+        bottom.grid(row=4, column=0, sticky='ew', padx=22, pady=(4, 14))
+        bottom.pack_propagate(False)
+
+        self.state_chip = ctk.CTkFrame(bottom, fg_color=T.INPUT, corner_radius=14, height=28)
+        self.state_chip.pack(side='right', padx=(4, 10))
+        self.dot = ctk.CTkLabel(self.state_chip, text='●', font=T.font(12), text_color=T.WARN)
+        self.dot.pack(side='left', padx=(12, 4))
+        self.head_status = ctk.CTkLabel(self.state_chip, text='กำลังเตรียม…', font=T.font(12, 'bold'),
+                                        text_color=T.TEXT_DIM)
+        self.head_status.pack(side='left', padx=(0, 12))
+
+        def ghost(text, width, command):
+            return ctk.CTkButton(bottom, text=text, width=width, height=30, corner_radius=15,
+                                 font=T.font(12), fg_color='transparent', hover_color=T.SURFACE_3,
+                                 text_color=T.TEXT_DIM, command=command)
+
+        self.btn_update = ghost('⟳  ตรวจอัปเดต', 118, lambda: self.check_update(quiet=False))
+        self.btn_update.pack(side='right', padx=(2, 0))
+        ghost('⚙  ตั้งค่า', 92, self.open_settings).pack(side='right', padx=(0, 2))
+
+        self.status_icon = ctk.CTkLabel(bottom, text='•', width=18, font=T.font(14, 'bold'),
+                                        text_color=T.TEXT_FAINT)
+        self.status_icon.pack(side='left', padx=(14, 4))
+        self.status = ctk.CTkLabel(bottom, text='', font=T.font(13), text_color=T.TEXT_DIM,
                                    anchor='w')
-        self.status.pack(side='left', fill='x', expand=True, padx=(4, 12))
+        self.status.pack(side='left', fill='x', expand=True, padx=(0, 12))
+
+    def _set_state_chip(self, text, color):
+        self.dot.configure(text_color=color)
+        self.head_status.configure(text=text, text_color=color)
+        self.state_chip.configure(fg_color=T.mix(T.SURFACE, color, 0.14))
 
     def _switch(self, parent, text, cmd, default):
         var = ctk.BooleanVar(value=default)
@@ -617,8 +634,11 @@ class App(ctk.CTk):
 
     def say(self, text, tone=None):
         # the status line shares its row with the buttons on the right; keep it one line
-        short = text if len(text) <= 95 else text[:92].rstrip(' ,|') + '…'
-        self.status.configure(text=short, text_color=tone or T.TEXT_FAINT)
+        short = text if len(text) <= 90 else text[:87].rstrip(' ,|') + '…'
+        icon = {T.OK: '✓', T.WARN: '!', T.DANGER: '✕'}.get(tone, '•')
+        self.status_icon.configure(text=icon, text_color=tone or T.TEXT_FAINT)
+        # the message itself stays calm; only its icon carries the colour — except errors
+        self.status.configure(text=short, text_color=T.DANGER if tone == T.DANGER else T.TEXT_DIM)
 
     # ---------------------------------------------------------------- devices
     def refresh_devices(self, initial=False):
@@ -681,16 +701,13 @@ class App(ctk.CTk):
     def _update_banner(self, problems):
         self._last_problems = list(problems)
         if problems:
-            self.dot.configure(text_color=T.DANGER)
-            self.head_status.configure(text='เปิดอุปกรณ์ไม่ได้', text_color=T.DANGER)
+            self._set_state_chip('เปิดอุปกรณ์ไม่ได้', T.DANGER)
             self.say(' | '.join(problems), T.DANGER)
         elif ae.guess_cable_device(self.devices, verify=False) is None:
-            self.dot.configure(text_color=T.WARN)
-            self.head_status.configure(text='ยังไม่มี Virtual Cable', text_color=T.WARN)
+            self._set_state_chip('ยังไม่มี Virtual Cable', T.WARN)
             self.say('ต้องติดตั้ง VB-CABLE ก่อน เสียงถึงจะเข้าไมค์ในเกมได้ — ดูวิธีใน README', T.WARN)
         else:
-            self.dot.configure(text_color=T.OK)
-            self.head_status.configure(text='พร้อมใช้งาน', text_color=T.OK)
+            self._set_state_chip('พร้อมใช้งาน', T.OK)
             self.say('อุปกรณ์เสียงเชื่อมต่อแล้ว')
 
     def apply_volumes(self):
@@ -2566,7 +2583,7 @@ class App(ctk.CTk):
 
     def _show_update_button(self, info):
         self._pending_update = info
-        self.btn_update.configure(text=f"อัปเดต v{info['version']}", fg_color=T.PINK,
+        self.btn_update.configure(text=f"⬆  อัปเดต v{info['version']}", width=132, fg_color=T.PINK,
                                   hover_color=T.PINK_DARK, text_color=T.ON_ACCENT,
                                   command=lambda: self.offer_update(info))
 

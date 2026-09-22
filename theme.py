@@ -105,6 +105,13 @@ WHITE = '#FFFFFF'
 
 
 # ---------------------------------------------------------------- contrast helpers
+def mix(a, b, amount):
+    """Blend colour a towards b: amount 0 -> a, 1 -> b. For tinted chip backgrounds."""
+    ca = [int(a.lstrip('#')[i:i + 2], 16) for i in (0, 2, 4)]
+    cb = [int(b.lstrip('#')[i:i + 2], 16) for i in (0, 2, 4)]
+    return '#' + ''.join(f'{round(x + (y - x) * amount):02X}' for x, y in zip(ca, cb))
+
+
 def _luminance(hex_color):
     h = hex_color.lstrip('#')
     rgb = [int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
