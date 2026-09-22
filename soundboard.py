@@ -61,7 +61,7 @@ def default_config():
         'game_volume': 100, 'monitor_volume': 60, 'mic_volume': 100,
         'exclusive': True, 'hotkeys_enabled': True, 'tray': True, 'tray_notified': False,
         'stop_hotkey': 'ctrl+alt+s', 'sounds': [],
-        'hear_self': False, 'auto_update': True, 'theme': T.DEFAULT,
+        'hear_self': False, 'auto_update': True, 'color': T.DEFAULT, 'mode': 'dark',
         'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
         'cache_mb': 40, 'slots': [], 'view': 'slots',
     }
@@ -82,12 +82,16 @@ def watch_text(entry, callback):
 
 
 def peek_theme():
-    """Read just the theme from config.json — it has to be known before any widget exists."""
+    """(colour, mode) from config.json — needed before any widget exists.
+    Configs from v1.1-v1.3 only have a single 'theme' name; translate that."""
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as fh:
-            return json.load(fh).get('theme') or T.DEFAULT
+            data = json.load(fh)
     except Exception:
-        return T.DEFAULT
+        return T.DEFAULT, 'dark'
+    if data.get('color'):
+        return data['color'], data.get('mode', 'dark')
+    return T.from_legacy(data.get('theme'))
 
 
 # --------------------------------------------------------------------------- widgets
@@ -308,7 +312,7 @@ class DeviceRow:
 # --------------------------------------------------------------------------- app
 class App(ctk.CTk):
     def __init__(self):
-        T.apply(peek_theme())
+        T.apply(*peek_theme())
         ctk.set_appearance_mode(T.MODE)
         super().__init__(fg_color=T.BG)
         self.engine = ae.Engine()
@@ -413,21 +417,12 @@ class App(ctk.CTk):
         ctk.CTkLabel(titles, text=f'ส่งไฟล์เสียงเข้าไมค์ในเกม  ·  v{ver.VERSION}',
                      font=T.font(13), text_color=T.TEXT_FAINT).pack(anchor='w')
 
-        self.dot = ctk.CTkLabel(head, text='●', font=T.font(16), text_color=T.WARN)
-        self.dot.pack(side='right', padx=(8, 0))
-        self.head_status = ctk.CTkLabel(head, text='', font=T.font(14), text_color=T.TEXT_DIM)
-        self.head_status.pack(side='right')
-        self.btn_update = ctk.CTkButton(
-            head, text='ตรวจอัปเดต', width=112, height=32, corner_radius=9, font=T.font(13),
-            fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
-            command=lambda: self.check_update(quiet=False))
-        self.btn_update.pack(side='right', padx=14)
-        ctk.CTkButton(head, text='🎨  ธีม', width=92, height=32, corner_radius=9, font=T.font(13),
-                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
-                      command=self.open_theme_picker).pack(side='right')
-        ctk.CTkButton(head, text='⚙  ตั้งค่า', width=100, height=32, corner_radius=9, font=T.font(13),
-                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
-                      command=self.open_settings).pack(side='right', padx=(0, 8))
+        light = T.MODE == 'light'
+        ctk.CTkButton(head, text='🌙' if light else '☀', width=46, height=46, corner_radius=23,
+                      font=T.font(20), fg_color=T.INPUT, hover_color=T.SURFACE_3,
+                      text_color=T.TEXT, command=self.toggle_mode).pack(side='right')
+        ctk.CTkLabel(head, text='โหมดมืด' if light else 'โหมดสว่าง', font=T.font(12),
+                     text_color=T.TEXT_FAINT).pack(side='right', padx=(0, 8))
 
         # ---- devices card
         card = Card(self, 'อุปกรณ์เสียง')
@@ -529,9 +524,23 @@ class App(ctk.CTk):
                           text_color=T.ON_ACCENT if fill != T.INPUT else T.TEXT,
                           command=cmd).pack(side='left', padx=(0, 10))
 
-        self.status = ctk.CTkLabel(self, text='', font=T.font(13), text_color=T.TEXT_FAINT,
+        bottom = ctk.CTkFrame(self, fg_color='transparent')
+        bottom.grid(row=4, column=0, sticky='ew', padx=22, pady=(2, 12))
+        self.dot = ctk.CTkLabel(bottom, text='●', font=T.font(15), text_color=T.WARN)
+        self.dot.pack(side='right', padx=(6, 2))
+        self.head_status = ctk.CTkLabel(bottom, text='', font=T.font(13), text_color=T.TEXT_DIM)
+        self.head_status.pack(side='right')
+        self.btn_update = ctk.CTkButton(
+            bottom, text='ตรวจอัปเดต', width=108, height=30, corner_radius=8, font=T.font(12),
+            fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+            command=lambda: self.check_update(quiet=False))
+        self.btn_update.pack(side='right', padx=(0, 14))
+        ctk.CTkButton(bottom, text='⚙  ตั้งค่า', width=96, height=30, corner_radius=8, font=T.font(12),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=self.open_settings).pack(side='right', padx=(0, 8))
+        self.status = ctk.CTkLabel(bottom, text='', font=T.font(13), text_color=T.TEXT_FAINT,
                                    anchor='w')
-        self.status.grid(row=4, column=0, sticky='ew', padx=26, pady=(0, 12))
+        self.status.pack(side='left', fill='x', expand=True, padx=(4, 12))
 
     def _switch(self, parent, text, cmd, default):
         var = ctk.BooleanVar(value=default)
@@ -544,7 +553,9 @@ class App(ctk.CTk):
         return sw
 
     def say(self, text, tone=None):
-        self.status.configure(text=text, text_color=tone or T.TEXT_FAINT)
+        # the status line shares its row with the buttons on the right; keep it one line
+        short = text if len(text) <= 95 else text[:92].rstrip(' ,|') + '…'
+        self.status.configure(text=short, text_color=tone or T.TEXT_FAINT)
 
     # ---------------------------------------------------------------- devices
     def refresh_devices(self, initial=False):
@@ -1463,7 +1474,7 @@ class App(ctk.CTk):
         self.engine.cache.budget = int(self.config_data.get('cache_mb', 40)) * 1024 * 1024
 
     def open_settings(self):
-        win = self._dialog('ตั้งค่า', 560, 700, modal=False)
+        win = self._dialog('ตั้งค่า', 580, 860, modal=False)
         ctk.CTkLabel(win, text='ตั้งค่า', font=T.font(19, 'bold'), text_color=T.TEXT).pack(pady=(18, 8))
         body = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12,
                             border_width=1, border_color=T.BORDER)
@@ -1490,6 +1501,34 @@ class App(ctk.CTk):
                                button_color=T.TEXT, button_hover_color=T.PINK, state=state)
             sw.pack(anchor='w', padx=18, pady=(8, 0))
             return var, sw
+
+        section('สีธีม', 'เปลี่ยนทันที ใช้ได้ทั้งโหมดมืดและสว่าง (สลับโหมดที่ปุ่มขวาบน)')
+        swatches = ctk.CTkFrame(body, fg_color='transparent')
+        swatches.pack(fill='x', padx=14, pady=(8, 0))
+        swatches.grid_columnconfigure((0, 1, 2), weight=1, uniform='sw')
+        for i, name in enumerate(T.NAMES):
+            pal = T.palette(name, T.MODE)
+            on = name == T.NAME
+            card = ctk.CTkFrame(swatches, fg_color=pal['SURFACE'], corner_radius=10, height=62,
+                                border_width=3 if on else 1,
+                                border_color=pal['PURPLE'] if on else pal['BORDER'])
+            card.grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky='ew')
+            card.pack_propagate(False)
+            label = ctk.CTkLabel(card, text=name + ('  ✓' if on else ''), font=T.font(13, 'bold'),
+                                 text_color=pal['TEXT'])
+            label.pack(anchor='w', padx=10, pady=(6, 2))
+            dots = ctk.CTkFrame(card, fg_color='transparent')
+            dots.pack(anchor='w', padx=10)
+            parts = [ctk.CTkFrame(dots, fg_color=pal[k], width=16, height=16, corner_radius=8)
+                     for k in ('PURPLE', 'PINK', 'BLUE')]
+            for d in parts:
+                d.pack(side='left', padx=(0, 4))
+            for w in (card, label, dots, *parts):
+                w.bind('<Button-1>', lambda _e, n=name: self.apply_theme(color=n, reopen_settings=True))
+                try:
+                    w.configure(cursor='hand2')
+                except Exception:
+                    pass
 
         section('ประมวลผลเสียง', 'ทำครั้งเดียวตอนโหลดไฟล์ ไม่เพิ่มงานตอนเล่น')
         switch('ตัดช่วงเงียบหัวท้าย — กดแล้วเสียงออกทันที', 'trim_silence',
@@ -1542,53 +1581,23 @@ class App(ctk.CTk):
                       text_color=T.TEXT_DIM, command=clear_cache).pack(anchor='w', padx=18, pady=(6, 16))
 
     # ---------------------------------------------------------------- themes
-    def open_theme_picker(self):
-        win = self._dialog('เลือกธีม', 660, 500, modal=False)
-        ctk.CTkLabel(win, text='เลือกธีม', font=T.font(19, 'bold'),
-                     text_color=T.TEXT).pack(pady=(20, 2))
-        ctk.CTkLabel(win, text='กดที่การ์ดเพื่อเปลี่ยนทันที — จำไว้ให้ครั้งหน้า',
-                     font=T.font(13), text_color=T.TEXT_FAINT).pack(pady=(0, 12))
-        grid = ctk.CTkFrame(win, fg_color='transparent')
-        grid.pack(fill='both', expand=True, padx=18, pady=(0, 18))
-        grid.grid_columnconfigure((0, 1, 2), weight=1, uniform='theme')
+    def toggle_mode(self):
+        self.apply_theme(mode='light' if T.MODE == 'dark' else 'dark')
 
-        for i, name in enumerate(T.NAMES):
-            pal = T.THEMES[name]
-            current = name == T.NAME
-            card = ctk.CTkFrame(grid, fg_color=pal['SURFACE'], corner_radius=12,
-                                border_width=3 if current else 1,
-                                border_color=pal['PURPLE'] if current else pal['BORDER'])
-            card.grid(row=i // 3, column=i % 3, padx=7, pady=7, sticky='nsew')
-            title = ctk.CTkLabel(card, text=name + ('   ✓' if current else ''),
-                                 font=T.font(15, 'bold'), text_color=pal['TEXT'])
-            title.pack(anchor='w', padx=14, pady=(12, 6))
-            dots = ctk.CTkFrame(card, fg_color='transparent')
-            dots.pack(anchor='w', padx=14)
-            swatches = [ctk.CTkFrame(dots, fg_color=pal[k], width=24, height=24, corner_radius=12)
-                        for k in ('PURPLE', 'PINK', 'BLUE')]
-            for s in swatches:
-                s.pack(side='left', padx=(0, 6))
-            mode = ctk.CTkLabel(card, text='โหมดสว่าง' if pal['MODE'] == 'light' else 'โหมดมืด',
-                                font=T.font(12), text_color=pal['TEXT_FAINT'])
-            mode.pack(anchor='w', padx=14, pady=(6, 12))
-            for w in (card, title, dots, mode, *swatches):
-                w.bind('<Button-1>', lambda _e, n=name: self.apply_theme(n))
-                try:
-                    w.configure(cursor='hand2')
-                except Exception:
-                    pass
-
-    def apply_theme(self, name):
-        if name == T.NAME:
+    def apply_theme(self, color=None, mode=None, reopen_settings=False):
+        color = color or T.NAME
+        mode = mode or T.MODE
+        if (color, mode) == (T.NAME, T.MODE):
             return
-        T.apply(name)
+        T.apply(color, mode)
         ctk.set_appearance_mode(T.MODE)
-        self.config_data['theme'] = T.NAME
+        self.config_data['color'], self.config_data['mode'] = T.NAME, T.MODE
+        self.config_data.pop('theme', None)
         self.save_config()
-        # the click came from a widget that the rebuild destroys — let it return first
-        self.after(20, self.rebuild_ui)
+        # the click came from a widget the rebuild destroys — let the handler return first
+        self.after(20, lambda: self.rebuild_ui(reopen_settings))
 
-    def rebuild_ui(self):
+    def rebuild_ui(self, reopen_settings=False):
         """Recreate every widget in the new colours. Audio streams, hotkeys and the tray
         are untouched, so a theme change never interrupts sound or the mic."""
         self.capturing = False
@@ -1613,7 +1622,9 @@ class App(ctk.CTk):
         self._update_banner(getattr(self, '_last_problems', []))
         if getattr(self, '_pending_update', None):
             self._show_update_button(self._pending_update)
-        self.say(f'เปลี่ยนเป็นธีม "{T.NAME}" แล้ว', T.OK)
+        self.say(f'ธีม {T.NAME} · {"โหมดสว่าง" if T.MODE == "light" else "โหมดมืด"}', T.OK)
+        if reopen_settings:
+            self.after(60, self.open_settings)
 
     # ---------------------------------------------------------------- updates
     def check_update(self, quiet=True):
@@ -1648,7 +1659,7 @@ class App(ctk.CTk):
                 self.say(f'ใช้เวอร์ชันล่าสุดอยู่แล้ว (v{ver.VERSION})', T.OK)
             return
         self._show_update_button(info)
-        self.say(f"มีเวอร์ชันใหม่ v{info['version']} — กดปุ่มสีชมพูมุมขวาบนเพื่อติดตั้ง", T.OK)
+        self.say(f"มีเวอร์ชันใหม่ v{info['version']} — กดปุ่มสีชมพูมุมขวาล่างเพื่อติดตั้ง", T.OK)
         if getattr(self, 'tray', None) is not None and self.tray.available:
             self.tray.notify(f"SoundSaoTer มีเวอร์ชันใหม่ v{info['version']}")
 
@@ -1726,7 +1737,8 @@ class App(ctk.CTk):
         self._scanned = self.scan_sounds_folder()
         if self._scanned:
             self.save_config()
-        self.config_data['theme'] = T.NAME
+        self.config_data['color'], self.config_data['mode'] = T.NAME, T.MODE
+        self.config_data.pop('theme', None)
         self._migrate_slots()
         self._apply_sound_processing()
         self._restore_widgets()
