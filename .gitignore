@@ -15,3 +15,4 @@ sounds/
 *.old
 *.new
 *.part
+.venv/

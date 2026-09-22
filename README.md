@@ -20,10 +20,12 @@ Windows ไม่เปิดให้โปรแกรมใด ๆ ยัด�
 1. **VB-CABLE** — แนบไว้ให้แล้วใน [vbcable/](vbcable/) (ไฟล์ต้นฉบับจาก https://www.vb-cable.com)
    แตกไฟล์ → คลิกขวา `VBCABLE_Setup_x64.exe` → **Run as administrator** → Install Driver → **รีสตาร์ตเครื่อง**
    VB-CABLE เป็น donationware ของ VB-Audio ไม่ใช่ของโปรเจกต์นี้ — ถ้าชอบช่วยสนับสนุนผู้พัฒนาได้
-2. ไลบรารี Python (ติดตั้งไว้ให้แล้วในเครื่องนี้):
+2. **Python 3.14** + ไลบรารี (ติดตั้งไว้ให้แล้วในเครื่องนี้ ที่โฟลเดอร์ `.venv`):
    ```
-   pip install -r requirements.txt
+   py -3.14 -m venv .venv
+   .venv\Scripts\python -m pip install -r requirements.txt
    ```
+   `run.bat` กับ `build.py` เลือกใช้ `.venv` ให้เอง ไม่ว่าคำสั่ง `python` ในเครื่องจะชี้ไปรุ่นไหน
 
 ## ดาวน์โหลด
 
@@ -65,7 +67,7 @@ https://github.com/Cinnammonmio/SoundSaoTer/releases/latest
 python build.py
 ```
 
-ได้ **`dist/SoundSaoTer.exe`** (~25 MB) ไฟล์เดียวจบ เพื่อนไม่ต้องมี Python
+ได้ **`dist/SoundSaoTer.exe`** (~56 MB เพราะรวม ffmpeg ของตัวตัดเสียง YouTube) ไฟล์เดียวจบ เพื่อนไม่ต้องมี Python
 สคริปต์จะเตรียมโฟลเดอร์ `dist/ส่งให้เพื่อน/` ที่มี exe + [อ่านก่อนใช้.txt](อ่านก่อนใช้.txt) + ตัวติดตั้ง VB-CABLE + โฟลเดอร์ `sounds/` ให้พร้อมซิปส่งเลย
 
 - `config.json` กับ `sounds/` จะถูกสร้างข้าง ๆ ตัว exe → ย้ายโฟลเดอร์ไปไหนก็พกค่าไปด้วย
@@ -330,7 +332,7 @@ python download_voice.py --site myinstants --get "https://www.myinstants.com/en/
 > ตัดคลิปสั้น ๆ ไว้ใช้เองในเกม ไม่ควรเอาไปเผยแพร่ต่อ
 >
 > YouTube เปลี่ยนระบบบ่อย ถ้าวันหนึ่งเปิดคลิปไม่ได้ทั้งที่ลิงก์ถูก แปลว่า yt-dlp ตามไม่ทัน —
-> อัปเดต yt-dlp (`pip install -U yt-dlp`) แล้ว build ออกเวอร์ชันใหม่
+> อัปเดต yt-dlp (`.venv\Scripts\python -m pip install -U yt-dlp`) แล้ว build ออกเวอร์ชันใหม่
 
 ## ปัญหาที่เจอบ่อย
 

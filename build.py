@@ -34,6 +34,8 @@ ARGS = [
     '--exclude-module', 'pkg_resources',  # runtime hook alone costs ~15 MB of RAM for nothing
     '--collect-all', 'pystray',         # system tray icon
     '--collect-submodules', 'PIL',      # pystray renders the tray icon with Pillow
+    '--exclude-module', 'PIL._avif',    # AVIF codec (7.5 MB) — the app never reads AVIF
+    '--exclude-module', 'PIL.AvifImagePlugin',
     '--collect-submodules', 'yt_dlp',   # ✂ YouTube: extractors are loaded lazily by name
     '--collect-all', 'av',              # ✂ YouTube: PyAV + its ffmpeg dlls
     '--hidden-import', 'ytclip',
@@ -41,7 +43,17 @@ ARGS = [
 ]
 
 
+VENV_PY = os.path.join(HERE, '.venv', 'Scripts', 'python.exe')
+
+
 def main():
+    # always build with the project's Python 3.14 venv, whichever `python` ran this
+    if os.path.isfile(VENV_PY) and os.path.normcase(sys.prefix) != os.path.normcase(os.path.join(HERE, '.venv')):
+        print(f'ใช้ Python ของโปรเจกต์: {VENV_PY}')
+        return subprocess.call([VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+    if sys.version_info < (3, 14):
+        print(f'!! กำลังใช้ Python {sys.version.split()[0]} — ควร build ด้วย 3.14 (ดู README หัวข้อ "ติดตั้ง")')
+
     icon = os.path.join(HERE, 'icon.ico')
     if not os.path.isfile(icon):
         print('ยังไม่มี icon.ico — สร้างก่อน')
