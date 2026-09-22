@@ -39,6 +39,8 @@ ARGS = [
     '--collect-submodules', 'yt_dlp',   # ✂ YouTube: extractors are loaded lazily by name
     '--collect-all', 'av',              # ✂ YouTube: PyAV + its ffmpeg dlls
     '--hidden-import', 'ytclip',
+    '--add-binary', f"{os.path.join(HERE, 'vendor', 'rnnoise', 'rnnoise.dll')}{os.pathsep}rnnoise",   # mic noise suppression
+    '--add-data', f"{os.path.join(HERE, 'vendor', 'rnnoise', 'COPYING-rnnoise.txt')}{os.pathsep}rnnoise",
     os.path.join(HERE, 'soundboard.py'),
 ]
 

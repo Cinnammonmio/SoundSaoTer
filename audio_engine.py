@@ -6,6 +6,8 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
+import micfx
+
 MAX_SECONDS = 120  # safety cap so a huge file can't eat all the RAM
 LIVE_MAX_MS = 120  # mic passthrough: drop the oldest audio past this much backlog
 
@@ -267,8 +269,11 @@ class DevicePlayer:
 class MicInput:
     """Reads the real microphone and feeds it straight into a DevicePlayer."""
 
-    def __init__(self, device_index, sink: DevicePlayer, monitor: DevicePlayer = None):
+    def __init__(self, device_index, sink: DevicePlayer, monitor: DevicePlayer = None,
+                 fx: 'micfx.MicProcessor' = None):
         info = sd.query_devices(device_index)
+        self.fx = fx                    # noise suppression / gate / auto volume (optional)
+        self._to48 = self._from48 = None
         self.device = device_index
         self.name = info['name']
         self.sink = sink
@@ -301,10 +306,31 @@ class MicInput:
         if monitor is not None and monitor.samplerate != sink.samplerate:
             # the monitor branch may run at a different rate than the cable
             self._mon_resampler = StreamResampler(sink.samplerate, monitor.samplerate, 1)
+        if fx is not None:
+            # voice processing runs at 48 kHz mono: bridge the mic and the cable to it
+            if self.samplerate != micfx.RATE:
+                self._to48 = StreamResampler(self.samplerate, micfx.RATE, 1)
+            if sink.samplerate != micfx.RATE:
+                self._from48 = StreamResampler(micfx.RATE, sink.samplerate, 1)
+            fx.attach()                 # stream not running yet: safe to load RNNoise
         self.stream.start()
 
+    def _process_fx(self, indata):
+        mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
+        mono = np.ascontiguousarray(mono, dtype=np.float32)
+        if self._to48 is not None:
+            mono = self._to48.process(mono)
+        out = self.fx.process(mono[:, 0])[:, None]
+        if self._from48 is not None:
+            out = self._from48.process(np.ascontiguousarray(out))
+        return out
+
     def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
-        block = indata if self._resampler is None else self._resampler.process(indata)
+        fx = self.fx
+        if fx is not None and fx.active:
+            block = self._process_fx(indata)
+        else:
+            block = indata if self._resampler is None else self._resampler.process(indata)
         peak = float(np.abs(block).max()) if block.shape[0] else 0.0
         self.peak = max(peak, self.peak * 0.75)
         if self.muted or block.shape[0] == 0:
@@ -330,6 +356,8 @@ class MicInput:
             self.stream.close()
         except Exception:
             pass
+        if self.fx is not None:
+            self.fx.detach()            # stream stopped: safe to free RNNoise
         self.sink.clear_live()
         if self.monitor is not None:
             self.monitor.clear_live()
@@ -345,6 +373,7 @@ class Engine:
         self.mic = None
         self.mic_device = None
         self.mic_gain = 1.0
+        self.micfx = micfx.MicProcessor()
         self._preview = None
         self.monitor_self = False
         self.exclusive = True
@@ -382,7 +411,7 @@ class Engine:
             return None
         sink.live_gain = self.mic_gain
         monitor = self.players.get('monitor')
-        self.mic = MicInput(self.mic_device, sink, monitor)
+        self.mic = MicInput(self.mic_device, sink, monitor, self.micfx)
         self.mic.monitor_on = self.monitor_self
         return self.mic
 
@@ -402,6 +431,27 @@ class Engine:
         self._stop_mic()
         self.mic_device = device_index
         return self._start_mic()
+
+    def set_mic_fx(self, denoise=None, gate=None, sensitivity=None, agc=None):
+        """Change voice processing live. Turning RNNoise on or off restarts the mic
+        stream (~0.1 s), so the model is never loaded or freed under the callback."""
+        fx = self.micfx
+        before = fx.needs_ai
+        after = (fx.denoise if denoise is None else bool(denoise)) or (fx.gate if gate is None else bool(gate))
+        restart = before != after and self.mic is not None
+        muted = restart and self.mic.muted
+        if restart:
+            self._stop_mic()
+        if denoise is not None:
+            fx.denoise = bool(denoise)
+        if gate is not None:
+            fx.gate = bool(gate)
+        if sensitivity is not None:
+            fx.sensitivity = float(sensitivity)
+        if agc is not None:
+            fx.agc = bool(agc)
+        if restart and self._start_mic() is not None:
+            self.mic.muted = muted          # a restart must not un-mute the mic
 
     def set_mic_gain(self, gain):
         self.mic_gain = float(gain)

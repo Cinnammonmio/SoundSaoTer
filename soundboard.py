@@ -72,6 +72,7 @@ def default_config():
         'hear_self': False, 'auto_update': True, 'color': T.DEFAULT, 'mode': 'dark',
         'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
         'cache_mb': 40, 'slots': [], 'view': 'slots',
+        'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
     }
 
 
@@ -502,6 +503,11 @@ class App(ctk.CTk):
         ctk.CTkButton(meter_row, text='ทดสอบเสียง', width=118, height=34, corner_radius=8,
                       font=T.font(13), fg_color=T.INPUT, hover_color=T.SURFACE_3,
                       text_color=T.TEXT_DIM, command=self.test_tone).pack(side='left', padx=6)
+        self.btn_micfx = ctk.CTkButton(meter_row, text=self._mic_fx_label(), width=150, height=34,
+                                       corner_radius=8, font=T.font(13), fg_color=T.INPUT,
+                                       hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                                       command=self.open_mic_fx)
+        self.btn_micfx.pack(side='left')
 
         self.var_hearself = ctk.BooleanVar(value=False)
         sw = ctk.CTkSwitch(meter_row, text='ฟังเสียงตัวเอง', variable=self.var_hearself,
@@ -1350,6 +1356,177 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(80, self._tick)
+
+    # ---------------------------------------------------------------- mic voice processing
+    def _mic_fx_label(self):
+        fx = self.engine.micfx
+        on = [name for name, flag in (('ตัดเสียงรบกวน', fx.denoise), ('ตัดตอนไม่พูด', fx.gate),
+                                      ('ปรับดังอัตโนมัติ', fx.agc)) if flag]
+        return '🎚  ปรับเสียงไมค์' + (f' · เปิด {len(on)}' if on else '')
+
+    def _refresh_mic_fx_button(self):
+        btn = getattr(self, 'btn_micfx', None)
+        if btn is not None and btn.winfo_exists():
+            active = self.engine.micfx.active
+            btn.configure(text=self._mic_fx_label(), fg_color=T.PURPLE if active else T.INPUT,
+                          text_color=T.ON_ACCENT if active else T.TEXT_DIM)
+
+    def open_mic_fx(self):
+        existing = getattr(self, '_fx_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import numpy as np
+        import micfx
+        fx = self.engine.micfx
+        cfg = self.config_data
+        win = self._dialog('ปรับเสียงไมค์', 600, 650, modal=False)
+        self._fx_win = win
+
+        ctk.CTkLabel(win, text='🎚  ปรับเสียงไมค์', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(18, 0))
+        ctk.CTkLabel(win, text='ทำกับไมค์จริงก่อนส่งเข้าเกม — แบบเดียวกับ Voice Processing ของ Discord · เปลี่ยนแล้วมีผลทันที',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(anchor='w', padx=24, pady=(2, 12))
+
+        def card(title, desc, value, command):
+            box = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12, border_width=1, border_color=T.BORDER)
+            box.pack(fill='x', padx=20, pady=5)
+            head = ctk.CTkFrame(box, fg_color='transparent')
+            head.pack(fill='x', padx=16, pady=(12, 2))
+            ctk.CTkLabel(head, text=title, font=T.font(15, 'bold'), text_color=T.TEXT).pack(side='left')
+            var = ctk.BooleanVar(value=value)
+            ctk.CTkSwitch(head, text='', variable=var, command=command, width=44, switch_width=44,
+                          switch_height=22, progress_color=T.PURPLE, fg_color=T.INPUT,
+                          button_color=T.TEXT, button_hover_color=T.PINK).pack(side='right')
+            ctk.CTkLabel(box, text=desc, font=T.font(12), text_color=T.TEXT_DIM, justify='left',
+                         anchor='w', wraplength=520).pack(fill='x', padx=16, pady=(0, 12))
+            return box, var
+
+        ai_ok = micfx.available()
+        _box, var_dn = card('ตัดเสียงรบกวน (AI)',
+                            'ตัดเสียงพัดลม แอร์ คีย์บอร์ด เสียงรอบห้อง ให้เพื่อนได้ยินแต่เสียงพูด\n'
+                            'ใช้ RNNoise · แรมเพิ่ม ~12 MB เฉพาะตอนเปิด · หน่วงเพิ่ม ~20 ms',
+                            fx.denoise, lambda: changed())
+        gate_box, var_gate = card('ตัดไมค์ตอนไม่ได้พูด',
+                                  'ไมค์เงียบสนิทระหว่างที่ไม่ได้พูด — ใช้ AI ฟังว่าเป็นเสียงคน '
+                                  'เสียงกดคีย์บอร์ดหรือเสียงประตูจะไม่ทำให้ไมค์เปิด',
+                                  fx.gate, lambda: changed())
+        sens_row = ctk.CTkFrame(gate_box, fg_color='transparent')
+        sens_row.pack(fill='x', padx=16, pady=(0, 12))
+        ctk.CTkLabel(sens_row, text='ความไว', font=T.font(12), text_color=T.TEXT_DIM).pack(side='left')
+        ctk.CTkLabel(sens_row, text='ต้องพูดชัด', font=T.font(11), text_color=T.TEXT_FAINT).pack(side='left', padx=(10, 6))
+        sens = ctk.CTkSlider(sens_row, from_=0, to=100, number_of_steps=20, height=16,
+                             button_color=T.PURPLE, button_hover_color=T.PINK, progress_color=T.PURPLE,
+                             fg_color=T.INPUT, command=lambda v: sens_changed(v))
+        sens.set(fx.sensitivity)
+        sens.pack(side='left', fill='x', expand=True)
+        ctk.CTkLabel(sens_row, text='เปิดง่าย', font=T.font(11), text_color=T.TEXT_FAINT).pack(side='left', padx=(6, 0))
+        _box, var_agc = card('ปรับความดังอัตโนมัติ',
+                             'พูดเบาก็ดังขึ้น ตะโกนก็ไม่แตก — ปรับเฉพาะตอนพูด ไม่ดันเสียงรบกวนขึ้นมา · '
+                             'ได้ผลดีสุดเมื่อเปิด "ตัดเสียงรบกวน" ด้วย',
+                             fx.agc, lambda: changed())
+
+        # ---- live meters
+        live = ctk.CTkFrame(win, fg_color=T.SURFACE_2, corner_radius=12)
+        live.pack(fill='x', padx=20, pady=(10, 4))
+
+        def meter(label):
+            row = ctk.CTkFrame(live, fg_color='transparent')
+            row.pack(fill='x', padx=16, pady=(10, 0))
+            ctk.CTkLabel(row, text=label, width=110, anchor='w', font=T.font(12),
+                         text_color=T.TEXT_DIM).pack(side='left')
+            bar = ctk.CTkProgressBar(row, height=10, corner_radius=4, fg_color=T.INPUT, progress_color=T.OK)
+            bar.pack(side='left', fill='x', expand=True)
+            bar.set(0)
+            return bar
+
+        m_in = meter('เสียงจากไมค์')
+        m_out = meter('เพื่อนได้ยิน')
+        foot = ctk.CTkFrame(live, fg_color='transparent')
+        foot.pack(fill='x', padx=16, pady=(8, 12))
+        talk = ctk.CTkLabel(foot, text='', font=T.font(13, 'bold'), text_color=T.TEXT_FAINT)
+        talk.pack(side='left')
+        ctk.CTkSwitch(foot, text='ฟังเสียงตัวเอง (ลองดูผล)', variable=self.var_hearself,
+                      command=self.apply_hear_self, font=T.font(12), text_color=T.TEXT_DIM,
+                      progress_color=T.OK, fg_color=T.INPUT, button_color=T.TEXT,
+                      button_hover_color=T.PINK, width=40, switch_width=38, switch_height=18).pack(side='right')
+
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
+                            anchor='w', wraplength=540)
+        note.pack(fill='x', padx=24, pady=(8, 14))
+        default_note = ('ยังไม่มีตัดเสียงสะท้อนจากลำโพง — ถ้าเพื่อนได้ยินเสียงเกมหรือเสียงตัวเองย้อนกลับ '
+                        'ให้ใช้หูฟังแทนลำโพง')
+
+        def set_note(text=None, tone=None):
+            note.configure(text=text or default_note, text_color=tone or T.TEXT_FAINT)
+
+        def sync():
+            var_dn.set(fx.denoise)
+            var_gate.set(fx.gate)
+            var_agc.set(fx.agc)
+            state = 'normal' if fx.gate else 'disabled'
+            sens.configure(state=state, button_color=T.PURPLE if fx.gate else T.SURFACE_3)
+            self._refresh_mic_fx_button()
+
+        def changed():
+            if (var_dn.get() or var_gate.get()) and not ai_ok:
+                var_dn.set(False)
+                var_gate.set(False)
+                set_note('ไม่พบไฟล์ตัวตัดเสียงรบกวน (rnnoise.dll) — ลองโหลดโปรแกรมใหม่', T.DANGER)
+            self.engine.set_mic_fx(denoise=var_dn.get(), gate=var_gate.get(), agc=var_agc.get())
+            if fx.error:
+                set_note(fx.error, T.DANGER)
+            elif self.engine.mic is None and fx.active:
+                set_note('ยังไม่ได้เลือก "ไมค์จริง" ในหน้าหลัก — ตั้งแล้วจะเริ่มทำงานเอง', T.WARN)
+            else:
+                set_note()
+            cfg.update(mic_denoise=fx.denoise, mic_gate=fx.gate, mic_agc=fx.agc)
+            self.save_config()
+            sync()
+
+        def sens_changed(value):
+            self.engine.set_mic_fx(sensitivity=value)
+            cfg['mic_gate_sens'] = int(value)
+            job = getattr(win, '_save_job', None)
+            if job:
+                win.after_cancel(job)
+            win._save_job = win.after(500, self.save_config)
+
+        def as_bar(level):
+            db = 20 * np.log10(max(level, 1e-6))
+            return min(1.0, max(0.0, (db + 60) / 60))      # -60 dBFS .. 0 dBFS
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            mic = self.engine.mic
+            if mic is None:
+                m_in.set(0)
+                m_out.set(0)
+                talk.configure(text='ยังไม่ได้เลือกไมค์จริง', text_color=T.WARN)
+            else:
+                if fx.active:
+                    lin, lout = fx.level_in, fx.level_out
+                    fx.level_in *= 0.7
+                    fx.level_out *= 0.7
+                else:
+                    lin = lout = mic.peak
+                m_in.set(as_bar(lin))
+                m_out.set(as_bar(0 if mic.muted else lout))
+                if mic.muted:
+                    talk.configure(text='ปิดไมค์อยู่', text_color=T.WARN)
+                elif fx.gate:
+                    talk.configure(text='● กำลังพูด' if fx.speaking else '○ ไมค์ปิดรอเสียงพูด',
+                                   text_color=T.OK if fx.speaking else T.TEXT_FAINT)
+                else:
+                    talk.configure(text='')
+            win.after(60, tick)
+
+        sync()
+        set_note(fx.error or None, T.DANGER if fx.error else None)
+        tick()
 
     # ---------------------------------------------------------------- YouTube clipper
     def open_yt_clipper(self):
@@ -2433,6 +2610,12 @@ class App(ctk.CTk):
         self.stop_badge.configure(text=self.config_data['stop_hotkey'] or 'ตั้งปุ่ม')
         self.var_hearself.set(bool(self.config_data.get('hear_self')))
         self.engine.set_monitor_self(self.var_hearself.get())   # applied when the mic starts
+        fx = self.engine.micfx                                  # also before the mic starts
+        fx.denoise = bool(self.config_data.get('mic_denoise'))
+        fx.gate = bool(self.config_data.get('mic_gate'))
+        fx.sensitivity = float(self.config_data.get('mic_gate_sens', 50))
+        fx.agc = bool(self.config_data.get('mic_agc'))
+        self._refresh_mic_fx_button()
         self.engine.exclusive = self.config_data['exclusive']
         self.view_var.set('📚  คลังเสียง' if self.config_data.get('view') == 'library' else '🎯  ช่องคีย์ลัด')
         self.view_tabs._paint()
