@@ -11,6 +11,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = 'SoundSaoTer'
+# the version, stamped into the bundle: lets the exe notice it was started on another
+# version's unpacked files (see rthook_fresh.py)
+STAMP = os.path.join(HERE, 'build', 'build_stamp.txt')
 
 ARGS = [
     sys.executable, '-m', 'PyInstaller',
@@ -20,13 +23,20 @@ ARGS = [
     '--name', NAME,
     '--icon', os.path.join(HERE, 'icon.ico'),
     '--add-data', f"{os.path.join(HERE, 'icon.ico')}{os.pathsep}.",
+    '--add-data', f"{STAMP}{os.pathsep}.",
+    '--runtime-hook', os.path.join(HERE, 'rthook_fresh.py'),   # runs first: see the file
     '--collect-all', 'customtkinter',   # ships its theme json + assets
     '--collect-all', 'sounddevice',     # portaudio dll
     '--collect-all', 'soundfile',       # libsndfile dll (mp3/ogg/flac support)
     '--exclude-module', 'matplotlib',
     '--exclude-module', 'pytest',
+    '--exclude-module', 'setuptools',   # dragged in via cffi's build helpers; at startup its
+    '--exclude-module', 'pkg_resources',  # runtime hook alone costs ~15 MB of RAM for nothing
     '--collect-all', 'pystray',         # system tray icon
     '--collect-submodules', 'PIL',      # pystray renders the tray icon with Pillow
+    '--collect-submodules', 'yt_dlp',   # ✂ YouTube: extractors are loaded lazily by name
+    '--collect-all', 'av',              # ✂ YouTube: PyAV + its ffmpeg dlls
+    '--hidden-import', 'ytclip',
     os.path.join(HERE, 'soundboard.py'),
 ]
 
@@ -38,6 +48,11 @@ def main():
         subprocess.check_call([sys.executable, os.path.join(HERE, 'make_icon.py')])
 
     print('กำลังสร้าง exe (ใช้เวลาสัก 1–3 นาที) ...\n')
+    sys.path.insert(0, HERE)
+    import version
+    os.makedirs(os.path.dirname(STAMP), exist_ok=True)
+    with open(STAMP, 'w', encoding='utf-8') as fh:
+        fh.write(version.VERSION)
     subprocess.check_call(ARGS, cwd=HERE)
 
     exe = os.path.join(HERE, 'dist', NAME + '.exe')

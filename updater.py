@@ -112,5 +112,8 @@ def apply(new_path, relaunch=True):
         os.replace(old, exe)        # ย้ายตัวใหม่ไม่สำเร็จ เอาตัวเก่ากลับมา
         raise
     if relaunch:
-        subprocess.Popen([exe], cwd=os.path.dirname(exe), close_fds=True)
+        # a fresh environment: otherwise PyInstaller treats the new exe as our child
+        # and runs it on this (old) version's unpacked files
+        subprocess.Popen([exe], cwd=os.path.dirname(exe), close_fds=True,
+                         env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1'))
     return exe

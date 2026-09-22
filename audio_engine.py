@@ -450,6 +450,17 @@ class Engine:
         player.play(data, gain=max(0.3, gain), exclusive=True)
         return player.name
 
+    def preview_data(self, samples, samplerate):
+        """Same as preview(), for audio that only exists in memory (the YouTube clipper)."""
+        player, gain = self._preview_player()
+        if player is None:
+            raise RuntimeError('ไม่มีอุปกรณ์สำหรับฟัง — เลือกช่อง "ฟังเองที่หูฟัง" ก่อน')
+        data = np.asarray(samples, dtype=np.float32).reshape(-1, 1)
+        data = np.ascontiguousarray(_to_channels(_resample(data, samplerate, player.samplerate),
+                                                 player.channels))
+        player.play(data, gain=max(0.3, gain), exclusive=True)
+        return player.name
+
     def stop(self):
         with self._lock:
             players = list(self.players.values())

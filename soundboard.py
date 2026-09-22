@@ -1,8 +1,15 @@
 """Soundboard: press a hotkey, the sound file goes out through your game mic."""
 import json
 import os
-import queue
 import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == '--yt-worker':
+    # child process of the YouTube clipper: do one job and exit, never load the UI
+    import ytclip
+    sys.exit(ytclip.worker_main(sys.argv[2:]))
+
+
+import queue
 import tempfile
 import threading
 import tkinter as tk
@@ -519,6 +526,7 @@ class App(ctk.CTk):
             ('+  เพิ่มไฟล์', self.add_files, T.PURPLE, T.PURPLE_DARK),
             ('+  เพิ่มทั้งโฟลเดอร์', self.add_folder, T.INPUT, T.SURFACE_3),
             ('⭳  โหลดเสียงจากเว็บ', self.open_downloader, T.PINK, T.PINK_DARK),
+            ('✂  ตัดจาก YouTube', self.open_yt_clipper, T.BLUE, T.BLUE_DARK),
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
@@ -852,6 +860,8 @@ class App(ctk.CTk):
             return 'Dota'
         if re.search(r'\[td\d+\]$', stem):
             return 'TiengDong'
+        if re.search(r'\[yt[\w-]+-\d+\]$', stem):
+            return 'YouTube'
         if re.search(r'\[\d+\]$', stem):
             return 'Myinstants'
         return 'ของฉัน'
@@ -872,10 +882,10 @@ class App(ctk.CTk):
         chips.pack(fill='x', padx=20, pady=(10, 6))
         src_var = ctk.StringVar(value='ทั้งหมด')
         free_var = ctk.BooleanVar(value=False)
-        group = ToggleGroup(chips, ['ทั้งหมด', 'Dota', 'Myinstants', 'TiengDong', 'ของฉัน'], src_var,
-                            command=lambda _v: schedule())
+        group = ToggleGroup(chips, ['ทั้งหมด', 'Dota', 'Myinstants', 'TiengDong', 'YouTube', 'ของฉัน'],
+                            src_var, command=lambda _v: schedule())
         for b in group.buttons.values():
-            b.configure(width=84, height=32)
+            b.configure(width=72, height=32)
         group.pack(side='left')
         ctk.CTkCheckBox(chips, text='ซ่อนที่อยู่ใน slot แล้ว', variable=free_var,
                         command=lambda: schedule(), font=T.font(12), text_color=T.TEXT_DIM,
@@ -1298,6 +1308,583 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(80, self._tick)
+
+    # ---------------------------------------------------------------- YouTube clipper
+    def open_yt_clipper(self):
+        existing = getattr(self, '_yt_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import numpy as np
+        import soundfile as sf
+        from PIL import Image, ImageTk
+        import ytclip as Y
+
+        Y.clean_work_dir()
+        try:
+            scale = self._get_window_scaling()
+        except Exception:
+            scale = 1.0
+        R = Y.RATE
+        PAD_L = int(46 * scale)                  # room for the Hz labels
+        PW = int(854 * scale)                    # plot width
+        PH = int(300 * scale)                    # plot height
+        RULER = int(24 * scale)
+        OVH = int(46 * scale)
+        CW = PAD_L + PW + int(6 * scale)
+        LENGTHS = {'15 วิ': 15, '30 วิ': 30, '60 วิ': 60}
+        MODES = ('ความถี่', 'คลื่นเสียง')
+
+        win = self._dialog('ตัดเสียงจาก YouTube', 960, 790, modal=False)
+        self._yt_win = win
+        st = {'info': None, 'start': 0.0, 'data': None, 'len': 0.0, 'ref': None, 'peak': 1.0,
+              'view': [0.0, 1.0], 'sel': [0.0, 0.0], 'busy': False, 'env': None, 'env_state': '',
+              'base': None, 'dimmed': None, 'photo': None, 'ov_photo': None, 'drag': None,
+              'pan': None, 'job': None, 'play': None}
+        lut = Y.make_lut([T.INPUT, T.PURPLE_DARK, T.PURPLE, T.PINK, T.TEXT])
+
+        ctk.CTkLabel(win, text='✂  ตัดเสียงจาก YouTube', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(16, 8))
+
+        head = ctk.CTkFrame(win, fg_color='transparent')
+        head.pack(fill='x', padx=24)
+        url_ent = ctk.CTkEntry(head, placeholder_text='วางลิงก์ YouTube แล้วกด Enter  (ลิงก์ที่มีเวลา &t= จะเปิดตรงนั้นเลย)',
+                               height=42, corner_radius=9, font=T.font(14), fg_color=T.INPUT,
+                               border_color=T.BORDER, text_color=T.TEXT)
+        url_ent.pack(side='left', fill='x', expand=True)
+        open_btn = ctk.CTkButton(head, text='เปิดคลิป', width=110, height=42, corner_radius=9,
+                                 font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PINK,
+                                 hover_color=T.PINK_DARK, command=lambda: open_clip())
+        open_btn.pack(side='left', padx=(10, 0))
+
+        info_row = ctk.CTkFrame(win, fg_color='transparent')
+        info_row.pack(fill='x', padx=24, pady=(10, 4))
+        info_lbl = ctk.CTkLabel(info_row, text='ยังไม่ได้เปิดคลิป', font=T.font(13), text_color=T.TEXT_DIM,
+                                anchor='w')
+        info_lbl.pack(side='left', fill='x', expand=True)
+        len_var = ctk.StringVar(value='30 วิ')
+        ToggleGroup(info_row, list(LENGTHS), len_var).pack(side='right')
+        ctk.CTkLabel(info_row, text='โหลดทีละ', font=T.font(12),
+                     text_color=T.TEXT_FAINT).pack(side='right', padx=(0, 8))
+
+        ov = tk.Canvas(win, width=CW, height=OVH, bg=T.INPUT, highlightthickness=0, cursor='hand2')
+        ov.pack(padx=24, pady=(2, 8))
+
+        tools = ctk.CTkFrame(win, fg_color='transparent')
+        tools.pack(fill='x', padx=24, pady=(0, 6))
+        mode_var = ctk.StringVar(value=MODES[0])
+        ToggleGroup(tools, list(MODES), mode_var, command=lambda _v: render()).pack(side='left')
+
+        def tool_btn(text, cmd, width=44):
+            b = ctk.CTkButton(tools, text=text, width=width, height=32, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT, command=cmd)
+            b.pack(side='right', padx=(6, 0))
+            return b
+
+        tool_btn('ดูทั้งช่วง', lambda: set_view(0, st['len']), 84)
+        tool_btn('ซูมที่เลือก', lambda: zoom_to_sel(), 90)
+        tool_btn('＋', lambda: zoom(0.5))
+        tool_btn('－', lambda: zoom(2.0))
+        next_btn = tool_btn('ช่วงถัดไป ▶', lambda: shift_window(+1), 100)
+        prev_btn = tool_btn('◀ ช่วงก่อน', lambda: shift_window(-1), 96)
+
+        canvas = tk.Canvas(win, width=CW, height=PH + RULER, bg=T.BG, highlightthickness=0, cursor='crosshair')
+        canvas.pack(padx=24)
+        img_item = canvas.create_image(PAD_L, 0, anchor='nw')
+        canvas.create_rectangle(PAD_L, 0, PAD_L + PW, PH, outline=T.BORDER, tags='frame')
+
+        sel_row = ctk.CTkFrame(win, fg_color='transparent')
+        sel_row.pack(fill='x', padx=24, pady=(10, 4))
+
+        def time_box(label, which):
+            ctk.CTkLabel(sel_row, text=label, font=T.font(13), text_color=T.TEXT_DIM).pack(side='left', padx=(0, 6))
+            ent = ctk.CTkEntry(sel_row, width=120, height=34, corner_radius=8, font=T.font(14),
+                               fg_color=T.INPUT, border_color=T.BORDER, text_color=T.TEXT, justify='center')
+            ent.pack(side='left')
+            for text, step in (('−', -0.01), ('+', 0.01)):
+                ctk.CTkButton(sel_row, text=text, width=32, height=34, corner_radius=8, font=T.font(15),
+                              fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                              command=lambda w=which, s=step: nudge(w, s)).pack(side='left', padx=(4, 0))
+            ent.bind('<Return>', lambda _e: commit(which))
+            ent.bind('<FocusOut>', lambda _e: commit(which))
+            return ent
+
+        start_ent = time_box('เริ่ม', 0)
+        ctk.CTkLabel(sel_row, text='', width=18).pack(side='left')
+        end_ent = time_box('จบ', 1)
+        len_lbl = ctk.CTkLabel(sel_row, text='', font=T.font(13, 'bold'), text_color=T.PINK)
+        len_lbl.pack(side='right')
+
+        act = ctk.CTkFrame(win, fg_color='transparent')
+        act.pack(fill='x', padx=24, pady=(8, 4))
+        ctk.CTkButton(act, text='▶  ฟังช่วงที่เลือก', width=150, height=40, corner_radius=9,
+                      font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PURPLE,
+                      hover_color=T.PURPLE_DARK, command=lambda: play_sel()).pack(side='left')
+        ctk.CTkButton(act, text='■', width=44, height=40, corner_radius=9, font=T.font(14),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                      command=lambda: stop_play()).pack(side='left', padx=(8, 0))
+        save_btn = ctk.CTkButton(act, text='บันทึกลงคลังเสียง', width=160, height=40, corner_radius=9,
+                                 font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PINK,
+                                 hover_color=T.PINK_DARK, command=lambda: save())
+        save_btn.pack(side='right')
+        name_ent = ctk.CTkEntry(act, placeholder_text='ตั้งชื่อเสียง', height=40, corner_radius=9,
+                                font=T.font(14), fg_color=T.INPUT, border_color=T.BORDER, text_color=T.TEXT)
+        name_ent.pack(side='left', fill='x', expand=True, padx=(16, 10))
+
+        HINT = ('ลากบนภาพ = เลือกช่วง  ·  ลากเส้นชมพู = ปรับขอบ  ·  ล้อเมาส์ = ซูม  ·  '
+                'คลิกขวาลาก / Shift+ล้อ = เลื่อน  ·  Space = ฟัง')
+        note = ctk.CTkLabel(win, text='วางลิงก์คลิปแล้วกด "เปิดคลิป"', font=T.font(12),
+                            text_color=T.TEXT_FAINT, anchor='w')
+        note.pack(fill='x', padx=26, pady=(6, 12))
+
+        def set_note(text, tone=None):
+            if win.winfo_exists():
+                note.configure(text=text, text_color=tone or T.TEXT_FAINT)
+
+        # ---------------------------------------------------- coordinates
+        def t_to_x(t):
+            v0, v1 = st['view']
+            return PAD_L + (t - v0) / (v1 - v0) * PW
+
+        def x_to_t(x):
+            v0, v1 = st['view']
+            return min(max(v0 + (x - PAD_L) / PW * (v1 - v0), 0.0), st['len'])
+
+        # ---------------------------------------------------- drawing
+        def schedule():
+            if st['job']:
+                win.after_cancel(st['job'])
+            st['job'] = win.after(16, render)
+
+        def render():
+            st['job'] = None
+            if st['data'] is None or not win.winfo_exists():
+                return
+            v0, v1 = st['view']
+            if mode_var.get() == MODES[0]:
+                if st['ref'] is None:                       # brightness scale from the whole window
+                    _img, st['ref'] = Y.spectrogram_rgb(st['data'], R, 0, st['len'], 300, 60, lut)
+                rgb, _ref = Y.spectrogram_rgb(st['data'], R, v0, v1, PW, PH, lut, st['ref'])
+            else:
+                rgb = Y.waveform_rgb(st['data'], R, v0, v1, PW, PH, T.INPUT, T.PURPLE, T.BORDER, st['peak'])
+            st['base'], st['dimmed'] = rgb, Y.dim(rgb, T.INPUT)
+            refresh()
+
+        def refresh():
+            compose()
+            overlay()
+            sync_entries()
+
+        def compose():
+            base, dimmed = st['base'], st['dimmed']
+            if base is None:
+                return
+            x0 = int(round(min(max(t_to_x(st['sel'][0]) - PAD_L, 0), PW)))
+            x1 = int(round(min(max(t_to_x(st['sel'][1]) - PAD_L, 0), PW)))
+            img = dimmed.copy()
+            if x1 > x0:
+                img[:, x0:x1] = base[:, x0:x1]
+            st['photo'] = ImageTk.PhotoImage(Image.fromarray(img), master=canvas)
+            canvas.itemconfigure(img_item, image=st['photo'])
+
+        def nice_step(span):
+            for step in (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30):
+                if span / step <= 8:
+                    return step
+            return 60
+
+        def overlay():
+            canvas.delete('ov')
+            small = ('Segoe UI', max(8, int(9 * scale)))
+            if mode_var.get() == MODES[0]:
+                for f, label in ((100, '100'), (300, '300'), (1000, '1k'), (3000, '3k'), (10000, '10k')):
+                    y = Y.freq_to_y(f, PH)
+                    canvas.create_line(PAD_L - 5, y, PAD_L, y, fill=T.TEXT_FAINT, tags='ov')
+                    canvas.create_text(PAD_L - 8, y, text=label, anchor='e', fill=T.TEXT_FAINT, font=small, tags='ov')
+                canvas.create_text(PAD_L - 8, 2, text='Hz', anchor='ne', fill=T.TEXT_FAINT, font=small, tags='ov')
+            v0, v1 = st['view']
+            step = nice_step(v1 - v0)
+            t = np.ceil(v0 / step) * step
+            edge = 26 * scale                          # labels this close to an end would be cut off
+            while t <= v1 + 1e-9:
+                x = t_to_x(t)
+                canvas.create_line(x, PH, x, PH + 5, fill=T.TEXT_FAINT, tags='ov')
+                if not PAD_L + edge <= x <= PAD_L + PW - edge:
+                    t += step
+                    continue
+                label = Y.fmt_time(st['start'] + t)
+                if step >= 1:
+                    label = label.split('.')[0]
+                elif step >= 0.1:
+                    label = label[:-2]
+                elif step >= 0.01:
+                    label = label[:-1]
+                canvas.create_text(x, PH + 7, text=label, anchor='n', fill=T.TEXT_DIM, font=small, tags='ov')
+                t += step
+            for t in st['sel']:
+                x = t_to_x(t)
+                if PAD_L - 1 <= x <= PAD_L + PW + 1:
+                    canvas.create_line(x, 0, x, PH, fill=T.PINK, width=2, tags='ov')
+                    s = 6 * scale
+                    canvas.create_polygon(x - s, 0, x + s, 0, x, s * 1.4, fill=T.PINK, outline='', tags='ov')
+                    canvas.create_polygon(x - s, PH, x + s, PH, x, PH - s * 1.4, fill=T.PINK, outline='', tags='ov')
+            canvas.tag_raise('frame')
+            draw_overview()
+
+        def draw_overview():
+            ov.delete('all')
+            info = st['info']
+            if not info:
+                return
+            dur = info['duration'] or max(st['start'] + st['len'], 1.0)
+            if st['env']:
+                st['ov_photo'] = ImageTk.PhotoImage(
+                    Image.fromarray(Y.envelope_rgb(st['env'], PW, OVH, T.INPUT, T.PURPLE_DARK)), master=ov)
+                ov.create_image(PAD_L, 0, anchor='nw', image=st['ov_photo'])
+            else:
+                ov.create_text(PAD_L + PW / 2, OVH / 2, text=st['env_state'], fill=T.TEXT_FAINT,
+                               font=('Segoe UI', max(8, int(10 * scale))))
+            small = ('Segoe UI', max(8, int(9 * scale)))
+            ov.create_text(PAD_L - 8, OVH / 2, text='ทั้งคลิป', anchor='e', fill=T.TEXT_FAINT, font=small)
+            ox = lambda t: PAD_L + t / dur * PW
+            ov.create_rectangle(ox(st['start']), 1, max(ox(st['start'] + st['len']), ox(st['start']) + 3),
+                                OVH - 1, outline=T.PINK, width=2)
+            a, b = (st['start'] + t for t in st['sel'])
+            ov.create_rectangle(ox(a), 4, max(ox(b), ox(a) + 2), OVH - 4, fill=T.PINK, outline='')
+
+        def sync_entries():
+            focus = win.focus_get()
+            for ent, t in ((start_ent, st['sel'][0]), (end_ent, st['sel'][1])):
+                if focus is not ent._entry:
+                    ent.delete(0, 'end')
+                    ent.insert(0, Y.fmt_time(st['start'] + t))
+            a, b = st['sel']
+            len_lbl.configure(text=f'ยาว {b - a:.3f} วินาที')
+
+        # ---------------------------------------------------- view
+        def set_view(a, b):
+            if st['data'] is None:
+                return
+            span = min(max(b - a, 0.02), st['len'])
+            a = min(max(a, 0.0), st['len'] - span)
+            st['view'] = [a, a + span]
+            schedule()
+
+        def zoom(factor, at=None):
+            v0, v1 = st['view']
+            span = v1 - v0
+            at = (v0 + v1) / 2 if at is None else at
+            new = min(max(span * factor, 0.02), st['len'])
+            set_view(at - (at - v0) * new / span, at - (at - v0) * new / span + new)
+
+        def zoom_to_sel():
+            a, b = st['sel']
+            pad = max((b - a) * 0.15, 0.01)
+            set_view(a - pad, b + pad)
+
+        def ensure_visible(t):
+            v0, v1 = st['view']
+            if not v0 <= t <= v1:
+                span = v1 - v0
+                set_view(t - span / 2, t + span / 2)
+
+        # ---------------------------------------------------- mouse
+        def near(x, t):
+            return abs(x - t_to_x(t)) <= 7 * scale
+
+        def press(e):
+            if st['data'] is None or e.y > PH:
+                return
+            s0, s1 = st['sel']
+            if near(e.x, s1):
+                st['drag'] = ['edge', 1]
+            elif near(e.x, s0):
+                st['drag'] = ['edge', 0]
+            else:
+                t = x_to_t(e.x)
+                st['drag'] = ['new', t, list(st['sel'])]
+                st['sel'] = [t, t]
+            refresh()
+
+        def motion(e):
+            d = st['drag']
+            if not d:
+                return
+            t = x_to_t(e.x)
+            if d[0] == 'edge':
+                st['sel'][d[1]] = t
+                if st['sel'][0] > st['sel'][1]:
+                    st['sel'].reverse()
+                    d[1] = 1 - d[1]
+            else:
+                st['sel'] = [min(d[1], t), max(d[1], t)]
+            refresh()
+
+        def release(_e):
+            d, st['drag'] = st['drag'], None
+            if d and d[0] == 'new' and st['sel'][1] - st['sel'][0] < 0.005:
+                st['sel'] = d[2]                     # a plain click keeps the old selection
+                refresh()
+
+        def hover(e):
+            if st['data'] is not None and e.y <= PH and (near(e.x, st['sel'][0]) or near(e.x, st['sel'][1])):
+                canvas.configure(cursor='sb_h_double_arrow')
+            else:
+                canvas.configure(cursor='crosshair')
+
+        def wheel(e):
+            if st['data'] is None:
+                return
+            v0, v1 = st['view']
+            if e.state & 0x0001:                     # Shift: pan
+                shift = -np.sign(e.delta) * 0.15 * (v1 - v0)
+                set_view(v0 + shift, v1 + shift)
+            else:
+                zoom(0.8 if e.delta > 0 else 1.25, x_to_t(e.x) if PAD_L <= e.x <= PAD_L + PW else None)
+
+        def pan_start(e):
+            st['pan'] = (e.x, list(st['view']))
+
+        def pan_move(e):
+            if not st['pan'] or st['data'] is None:
+                return
+            x0, (v0, v1) = st['pan']
+            dt = -(e.x - x0) / PW * (v1 - v0)
+            set_view(v0 + dt, v1 + dt)
+
+        canvas.bind('<ButtonPress-1>', press)
+        canvas.bind('<B1-Motion>', motion)
+        canvas.bind('<ButtonRelease-1>', release)
+        canvas.bind('<Motion>', hover)
+        canvas.bind('<MouseWheel>', wheel)
+        canvas.bind('<ButtonPress-3>', pan_start)
+        canvas.bind('<B3-Motion>', pan_move)
+
+        def ov_click(e):
+            info = st['info']
+            if not info or st['busy']:
+                return
+            dur = info['duration'] or 0
+            if dur <= 0:
+                return
+            t = min(max((e.x - PAD_L) / PW * dur, 0.0), dur)
+            length = LENGTHS[len_var.get()]
+            start = max(0.0, min(t - length / 2, dur - length))
+            load('window', start, [t - start, t - start + 1.0])
+
+        ov.bind('<ButtonPress-1>', ov_click)
+
+        # ---------------------------------------------------- selection by numbers
+        def put_sel(which, t):
+            t = min(max(t, 0.0), st['len'])
+            st['sel'][which] = t
+            if st['sel'][0] > st['sel'][1]:
+                st['sel'][1 - which] = t
+            ensure_visible(t)
+            refresh()
+
+        def nudge(which, step):
+            if st['data'] is not None:
+                put_sel(which, st['sel'][which] + step)
+
+        def commit(which):
+            if st['data'] is None:
+                return
+            ent = (start_ent, end_ent)[which]
+            value = Y.parse_time(ent.get())
+            if value is None:
+                set_note('พิมพ์เวลาแบบ 1:23.456 หรือ 83.456', T.WARN)
+                return sync_entries()
+            t = value - st['start']
+            if 0 <= t <= st['len']:
+                return put_sel(which, t)
+            # outside what is loaded: fetch the window around that time, keep the selection length
+            if st['busy']:
+                return sync_entries()
+            span = max(st['sel'][1] - st['sel'][0], 1.0)
+            start = max(0.0, value - 1.0) if which == 0 else max(0.0, value - span - 1.0)
+            hint = [value - start, value - start + span] if which == 0 else [value - span - start, value - start]
+            load('window', start, hint)
+
+        # ---------------------------------------------------- loading
+        def busy(on, text=None, tone=None):
+            st['busy'] = on
+            for b in (open_btn, prev_btn, next_btn, save_btn):
+                b.configure(state='disabled' if on else 'normal')
+            if text:
+                set_note(text, tone or (T.WARN if on else T.TEXT_FAINT))
+
+        def load(op, start, hint=None, url=None):
+            if st['busy']:
+                return
+            req = {'op': op, 'start': start, 'length': LENGTHS[len_var.get()]}
+            if op == 'open':
+                req['url'] = url
+            else:
+                req['info'] = st['info']
+            busy(True, 'กำลังเปิดคลิป… (ราว 3-5 วินาที)' if op == 'open' else
+                 f'กำลังโหลดช่วง {Y.fmt_time(start)[:-4]} …')
+
+            def worker():
+                try:
+                    res = Y.run(req)
+                    data, _sr = sf.read(res['wav'], dtype='float32')
+                    Y._remove(res['wav'])
+                    self.after(0, lambda: loaded(op, res, data, hint))
+                except Exception as exc:
+                    self.after(0, lambda: failed(exc))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def loaded(op, res, data, hint):
+            if not win.winfo_exists():
+                return
+            busy(False, HINT)
+            if len(data) < R * 0.05:
+                return set_note('ช่วงนี้ไม่มีเสียง ลองช่วงอื่น', T.WARN)
+            first = op == 'open' or st['info'] is None or st['info']['id'] != res['info']['id']
+            st.update(info=res['info'], start=res['start'], data=data, len=len(data) / R, ref=None,
+                      peak=max(float(np.abs(data).max()), 1e-4))
+            st['view'] = [0.0, st['len']]
+            a, b = hint or (0.0, min(2.0, st['len']))
+            a = min(max(a, 0.0), st['len'])
+            st['sel'] = [a, min(max(b, a + 0.05), st['len'])]
+            dur = res['info']['duration']
+            info_lbl.configure(text=f"{res['info']['title'][:60]}   ·   ยาว {Y.fmt_time(dur).split('.')[0] if dur else '?'}")
+            if first:
+                name_ent.delete(0, 'end')
+                name_ent.insert(0, src.clean(res['info']['title'], 40))
+                st['env'] = None
+                if 0 < dur <= Y.OVERVIEW_MAX_S:
+                    st['env_state'] = 'กำลังโหลดภาพรวมทั้งคลิป…'
+                    load_overview(res['info'])
+                else:
+                    st['env_state'] = 'คลิปยาวเกิน 20 นาที — ไม่แสดงภาพรวม (พิมพ์เวลาในช่อง "เริ่ม" เพื่อไปช่วงอื่น)'
+            render()
+
+        def failed(exc):
+            if win.winfo_exists():
+                busy(False, f'ไม่สำเร็จ: {exc}', T.DANGER)
+
+        def load_overview(info):
+            clip_id = info['id']
+
+            def worker():
+                try:
+                    env = Y.run({'op': 'overview', 'info': info})['env']
+                except Exception:
+                    env = None
+                self.after(0, lambda: got(env))
+
+            def got(env):
+                if not win.winfo_exists() or not st['info'] or st['info']['id'] != clip_id:
+                    return
+                st['env'] = env
+                st['env_state'] = '' if env else 'โหลดภาพรวมไม่ได้ — ใช้ ◀ ▶ หรือพิมพ์เวลาแทน'
+                draw_overview()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def open_clip(*_):
+            url = url_ent.get().strip()
+            if not url.lower().startswith('http'):
+                return set_note('วางลิงก์คลิป YouTube ก่อน (ขึ้นต้นด้วย https://)', T.WARN)
+            stop_play()
+            st['info'] = None
+            start = Y.start_from_url(url)
+            load('open', max(0.0, start - 1.0) if start else 0.0,
+                 [1.0, 3.0] if start else None, url=url)
+
+        def shift_window(direction):
+            if st['info'] is None or st['busy']:
+                return
+            length = LENGTHS[len_var.get()]
+            start = max(0.0, st['start'] + direction * length * 0.75)
+            dur = st['info']['duration']
+            if dur:
+                start = min(start, max(0.0, dur - length))
+            if abs(start - st['start']) < 0.01:
+                return set_note('สุดคลิปแล้ว', T.WARN)
+            load('window', start)
+
+        url_ent.bind('<Return>', open_clip)
+
+        # ---------------------------------------------------- listen & save
+        def selection():
+            a, b = st['sel']
+            return Y.fade(st['data'][int(a * R):int(b * R)], R)
+
+        def play_sel():
+            if st['data'] is None:
+                return
+            a, b = st['sel']
+            if b - a < 0.02:
+                return set_note('เลือกช่วงก่อน — ลากบนภาพ', T.WARN)
+            try:
+                where = self.engine.preview_data(selection(), R)
+            except Exception as exc:
+                return set_note(str(exc), T.WARN)
+            st['play'] = (time.monotonic(), a, b)
+            set_note(f'กำลังฟังทาง {where} (ไม่เข้าเกม)', T.OK)
+            tick_play()
+
+        def tick_play():
+            if not win.winfo_exists():
+                return
+            canvas.delete('ph')
+            p = st['play']
+            if not p:
+                return
+            t = p[1] + time.monotonic() - p[0]
+            if t >= p[2]:
+                st['play'] = None
+                return
+            x = t_to_x(t)
+            if PAD_L <= x <= PAD_L + PW:
+                canvas.create_line(x, 0, x, PH, fill=T.OK, width=2, tags='ph')
+            win.after(30, tick_play)
+
+        def stop_play():
+            if st.get('play'):
+                self.engine.stop()
+            st['play'] = None
+            if win.winfo_exists():
+                canvas.delete('ph')
+
+        def save():
+            if st['data'] is None:
+                return set_note('เปิดคลิปก่อน', T.WARN)
+            a, b = st['sel']
+            if b - a < 0.05:
+                return set_note('ช่วงที่เลือกสั้นเกินไป', T.WARN)
+            name = src.clean(name_ent.get().strip(), 60) or 'youtube clip'
+            clip_id = re.sub(r'[^\w-]', '', st['info']['id'])[:24] or 'clip'
+            ms = int(round((st['start'] + a) * 1000))
+            os.makedirs(SOUNDS_DIR, exist_ok=True)
+            path = os.path.join(SOUNDS_DIR, f'{name} [yt{clip_id}-{ms}].mp3')
+            try:
+                sf.write(path, selection(), R, format='MP3', subtype='MPEG_LAYER_III')
+            except Exception as exc:
+                return set_note(f'บันทึกไม่ได้: {exc}', T.DANGER)
+            self.add_paths([path])
+            set_note(f'บันทึกแล้ว: {os.path.basename(path)}  ({b - a:.2f} วิ) — ไปใส่ slot ได้เลย', T.OK)
+
+        def on_space(e):
+            if not isinstance(e.widget, tk.Entry):
+                play_sel()
+
+        win.bind('<space>', on_space)
+
+        def close():
+            Y.kill_all()
+            stop_play()
+            st.clear()
+            win.destroy()
+
+        win.protocol('WM_DELETE_WINDOW', close)
+        win.after(200, url_ent.focus_set)
 
     # ---------------------------------------------------------------- downloader
     def open_downloader(self):
@@ -1827,6 +2414,8 @@ class App(ctk.CTk):
                 self.hotkeys.close()
             except Exception:
                 pass
+        if 'ytclip' in sys.modules:
+            sys.modules['ytclip'].kill_all()
         self.save_config()
         self.engine.close()
         self.destroy()
