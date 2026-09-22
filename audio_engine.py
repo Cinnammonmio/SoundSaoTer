@@ -66,38 +66,106 @@ class StreamResampler:
 
 
 class SoundCache:
-    """Reads a file once, then keeps a copy per (samplerate, channels) target."""
+    """Decoded sounds, ready to play, kept under a RAM budget.
 
-    def __init__(self):
-        self._raw = {}      # path -> (data, samplerate)
-        self._conv = {}     # (path, sr, ch) -> data
+    Every play needs the file as float32 at the device's rate — a 4 s stereo clip is
+    ~1.5 MB decoded — so the cache keeps only the most recently used conversions and
+    drops the rest once `budget_mb` is exceeded. A sound that is still playing keeps
+    its own reference, so evicting it mid-play is harmless.
+    """
+
+    def __init__(self, budget_mb=40, trim=True, normalize=True):
+        from collections import OrderedDict
+        self.budget = int(budget_mb * 1024 * 1024)
+        self.trim = trim
+        self.normalize = normalize
+        self._conv = OrderedDict()      # (path, sr, ch) -> data, oldest first
+        self._bytes = 0
         self._lock = threading.Lock()
 
-    def raw(self, path):
-        with self._lock:
-            if path not in self._raw:
-                data, sr = sf.read(path, dtype='float32', always_2d=True)
-                if data.shape[0] > sr * MAX_SECONDS:
-                    data = data[:sr * MAX_SECONDS]
-                self._raw[path] = (data, sr)
-            return self._raw[path]
+    # -- one-off processing, done at load time so playback stays a plain copy --
+    def _decode(self, path):
+        data, sr = sf.read(path, dtype='float32', always_2d=True)
+        if data.shape[0] > sr * MAX_SECONDS:
+            data = data[:sr * MAX_SECONDS]
+        if self.trim:
+            data = trim_silence(data, sr)
+        if self.normalize:
+            data = normalize_loudness(data)
+        return data, sr
 
     def get(self, path, samplerate, channels):
         key = (path, samplerate, channels)
         with self._lock:
             hit = self._conv.get(key)
-        if hit is not None:
-            return hit
-        data, sr = self.raw(path)
+            if hit is not None:
+                self._conv.move_to_end(key)
+                return hit
+        data, sr = self._decode(path)
         conv = np.ascontiguousarray(_to_channels(_resample(data, sr, samplerate), channels))
         with self._lock:
-            self._conv[key] = conv
+            if key not in self._conv:
+                self._conv[key] = conv
+                self._bytes += conv.nbytes
+            while self._bytes > self.budget and len(self._conv) > 1:
+                _k, old = self._conv.popitem(last=False)
+                self._bytes -= old.nbytes
         return conv
+
+    def usage(self):
+        """(bytes used, budget bytes, entries)"""
+        with self._lock:
+            return self._bytes, self.budget, len(self._conv)
+
+    def set_processing(self, trim, normalize):
+        if (trim, normalize) != (self.trim, self.normalize):
+            self.trim, self.normalize = trim, normalize
+            self.clear()
 
     def clear(self):
         with self._lock:
-            self._raw.clear()
             self._conv.clear()
+            self._bytes = 0
+
+
+def trim_silence(data, sr, floor_db=-45.0, pad_ms=15.0):
+    """Cut the quiet lead-in and tail so a hotkey sounds instantly.
+
+    'Quiet' is relative to the file's own peak, so a soft recording is not eaten.
+    """
+    if data.shape[0] == 0:
+        return data
+    level = np.abs(data).max(axis=1)
+    peak = float(level.max())
+    if peak <= 1e-6:
+        return data
+    threshold = max(peak * 10 ** (floor_db / 20.0), 1e-4)
+    loud = np.flatnonzero(level > threshold)
+    pad = int(sr * pad_ms / 1000.0)
+    start = max(0, int(loud[0]) - pad)
+    end = min(data.shape[0], int(loud[-1]) + pad + 1)
+    if start == 0 and end == data.shape[0]:
+        return data
+    # copy, not a view — a view would keep the whole untrimmed file alive in RAM
+    return data[start:end].copy()
+
+
+def normalize_loudness(data, target_rms=0.12, max_boost=6.0, peak_ceiling=0.97):
+    """Scale so every clip sits at about the same loudness.
+
+    RMS is measured only over the parts that are actually sounding, so a short shout
+    with a long quiet tail is not over-boosted; the peak ceiling stops clipping.
+    """
+    if data.shape[0] == 0:
+        return data
+    mono = np.abs(data).mean(axis=1)
+    peak = float(np.abs(data).max())
+    if peak <= 1e-6:
+        return data
+    active = mono[mono > peak * 0.05]
+    rms = float(np.sqrt(np.mean(active ** 2))) if active.size else peak
+    gain = min(target_rms / max(rms, 1e-6), max_boost, peak_ceiling / peak)
+    return (data * np.float32(gain)).astype(np.float32)
 
 
 class DevicePlayer:
@@ -348,14 +416,15 @@ class Engine:
         with self._lock:
             return role in self.players
 
-    def play(self, path):
+    def play(self, path, gain=1.0):
+        """gain is the per-sound volume, on top of each device's own slider."""
         with self._lock:
             items = list(self.players.items())
         if not items:
             raise RuntimeError('no output device selected')
         for role, player in items:
             data = self.cache.get(path, player.samplerate, player.channels)
-            player.play(data, gain=self.gains.get(role, 1.0), exclusive=self.exclusive)
+            player.play(data, gain=self.gains.get(role, 1.0) * gain, exclusive=self.exclusive)
 
     # -- preview: your ears only, never the game device --
     def _preview_player(self):

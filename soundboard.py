@@ -36,6 +36,9 @@ import sources as src
 import hotkeys as hk
 import theme as T
 import tray as tray_mod
+import autostart
+import random
+import time
 import updater
 import version as ver
 
@@ -56,6 +59,8 @@ def default_config():
         'exclusive': True, 'hotkeys_enabled': True, 'tray': True, 'tray_notified': False,
         'stop_hotkey': 'ctrl+alt+s', 'sounds': [],
         'hear_self': False, 'auto_update': True, 'theme': T.DEFAULT,
+        'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
+        'cache_mb': 40,
     }
 
 
@@ -131,6 +136,16 @@ class SoundRow(ctk.CTkFrame):
                       font=T.font(14), fg_color='transparent', hover_color=T.DANGER,
                       text_color=T.TEXT_FAINT,
                       command=lambda: app.remove_sound(index)).pack(side='right', padx=(4, 8))
+
+        vol = int(data.get('volume', 100))
+        self.vol_chip = ctk.CTkButton(
+            self, text=f'🔊 {vol}%', width=74, height=32, corner_radius=8, font=T.font(13),
+            fg_color='transparent', hover_color=T.SURFACE_3, border_width=1,
+            border_color=T.BORDER, text_color=T.TEXT if vol != 100 else T.TEXT_FAINT,
+            command=lambda: app.edit_volume(index))
+        self.vol_chip.pack(side='right', padx=(6, 0))
+        # เลื่อนล้อเมาส์บนปุ่ม = ปรับทีละ 5%  (ไม่สร้าง slider ค้างไว้ทุกแถว ประหยัดแรม)
+        self.vol_chip.bind('<MouseWheel>', lambda e: app.nudge_volume(index, 5 if e.delta > 0 else -5))
 
         spec = data.get('hotkey')
         self.badge = ctk.CTkButton(
@@ -258,6 +273,12 @@ class App(ctk.CTk):
         if getattr(self, '_scanned', 0):
             self.say(f'พบไฟล์ใหม่ในโฟลเดอร์ sounds {self._scanned} ไฟล์ — เพิ่มเข้ารายการให้แล้ว', T.OK)
         self._start_tray()
+        try:
+            autostart.refresh()           # exe ถูกย้ายที่ -> ชี้ Run key ไปที่ใหม่
+        except Exception:
+            pass
+        if autostart.started_hidden() and self.tray.available:
+            self.withdraw()               # เปิดพร้อม Windows: ไปรอใน tray เงียบ ๆ
         updater.cleanup_old()
         self.after(2500, lambda: self.check_update(quiet=True))
         self.after(80, self._tick)
@@ -334,6 +355,9 @@ class App(ctk.CTk):
         ctk.CTkButton(head, text='🎨  ธีม', width=92, height=32, corner_radius=9, font=T.font(13),
                       fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
                       command=self.open_theme_picker).pack(side='right')
+        ctk.CTkButton(head, text='⚙  ตั้งค่า', width=100, height=32, corner_radius=9, font=T.font(13),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=self.open_settings).pack(side='right', padx=(0, 8))
 
         # ---- devices card
         card = Card(self, 'อุปกรณ์เสียง')
@@ -420,6 +444,7 @@ class App(ctk.CTk):
             ('+  เพิ่มไฟล์', self.add_files, T.PURPLE, T.PURPLE_DARK),
             ('+  เพิ่มทั้งโฟลเดอร์', self.add_folder, T.INPUT, T.SURFACE_3),
             ('⭳  โหลดเสียงจากเว็บ', self.open_downloader, T.PINK, T.PINK_DARK),
+            ('🎲  สุ่มเสียง', lambda: self.play_random(from_hotkey=False), T.BLUE, T.BLUE_DARK),
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
@@ -678,15 +703,86 @@ class App(ctk.CTk):
                       command=ok).pack(pady=20)
         win.bind('<Return>', lambda e: ok())
 
-    def play_path(self, path):
+    def _cooldown_left(self):
+        gap = float(self.config_data.get('cooldown') or 0)
+        return gap - (time.monotonic() - getattr(self, '_last_hotkey_play', -1e9)) if gap > 0 else 0
+
+    def _sound_volume(self, path):
+        key = self._key(path)
+        for s in self._rows():
+            if self._key(s['path']) == key:
+                return max(0, int(s.get('volume', 100))) / 100.0
+        return 1.0
+
+    def play_path(self, path, from_hotkey=False):
+        """from_hotkey: triggered in-game, so the anti-spam gap applies. Clicks in the
+        window are deliberate and never blocked."""
+        if from_hotkey:
+            left = self._cooldown_left()
+            if left > 0:
+                return self.say(f'กันสแปม: รออีก {left:.1f} วินาที', T.WARN)
+            self._last_hotkey_play = time.monotonic()
         try:
-            self.engine.play(path)
+            self.engine.play(path, gain=self._sound_volume(path))
             self.say(f'กำลังเล่น: {os.path.basename(path)}', T.OK)
             for row in self.rows:
                 if row.data['path'] == path:
                     row.flash()
         except Exception as exc:
             self.say(f'เล่นไม่ได้: {exc}', T.DANGER)
+
+    def play_random(self, from_hotkey=False):
+        pool = [s['path'] for s in self._rows()]
+        if not pool:
+            return self.say('ยังไม่มีเสียงให้สุ่ม', T.WARN)
+        last = getattr(self, '_last_random', None)
+        if len(pool) > 1 and last in pool:
+            pool.remove(last)                # ไม่สุ่มซ้ำตัวเดิมติดกัน
+        pick = random.choice(pool)
+        self._last_random = pick
+        self.play_path(pick, from_hotkey=from_hotkey)
+
+    # ---------------------------------------------------------------- per-sound volume
+    def _set_volume(self, index, value):
+        value = int(max(0, min(200, round(value))))
+        row = self._rows()[index]
+        row['volume'] = value
+        for r in self.rows:
+            if r.index == index:
+                r.vol_chip.configure(text=f'🔊 {value}%',
+                                     text_color=T.TEXT if value != 100 else T.TEXT_FAINT)
+        return value
+
+    def nudge_volume(self, index, step):
+        value = self._set_volume(index, int(self._rows()[index].get('volume', 100)) + step)
+        self.say(f"{self._rows()[index]['name'][:40]}: ดัง {value}%")
+        self.save_config()
+
+    def edit_volume(self, index):
+        row = self._rows()[index]
+        win = self._dialog('ดังเบาของเสียงนี้', 460, 230, modal=False)
+        ctk.CTkLabel(win, text=row['name'][:48], font=T.font(14, 'bold'),
+                     text_color=T.TEXT).pack(pady=(22, 10), padx=20)
+        var = tk.DoubleVar(value=int(row.get('volume', 100)))
+        pct = ctk.CTkLabel(win, text=f"{int(var.get())}%", font=T.font(22, 'bold'), text_color=T.PURPLE)
+
+        def moved(v):
+            pct.configure(text=f'{self._set_volume(index, float(v))}%')
+
+        ctk.CTkSlider(win, from_=0, to=200, number_of_steps=40, variable=var, width=360,
+                      progress_color=T.PINK, button_color=T.TEXT, button_hover_color=T.PURPLE,
+                      fg_color=T.INPUT, command=moved).pack()
+        pct.pack(pady=(8, 4))
+        bar = ctk.CTkFrame(win, fg_color='transparent')
+        bar.pack(pady=(4, 16))
+        ctk.CTkButton(bar, text='▶ ลองฟัง', width=110, height=34, corner_radius=9,
+                      font=T.font(13, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PURPLE,
+                      hover_color=T.PURPLE_DARK,
+                      command=lambda: self.play_path(row['path'])).pack(side='left', padx=5)
+        ctk.CTkButton(bar, text='100%', width=80, height=34, corner_radius=9, font=T.font(13),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: (var.set(100), moved(100))).pack(side='left', padx=5)
+        win.protocol('WM_DELETE_WINDOW', lambda: (self.save_config(), win.destroy()))
 
     def stop_all(self):
         self.engine.stop()
@@ -825,6 +921,7 @@ class App(ctk.CTk):
         entries, specs, bad = [], [], []
         wanted = [(r.get('hotkey'), partial(self._fire, r['path'])) for r in self._rows()]
         wanted.append((self.config_data.get('stop_hotkey'), self._fire_stop))
+        wanted.append((self.config_data.get('random_hotkey'), self._fire_random))
         for spec, callback in wanted:
             if not spec:
                 continue
@@ -853,12 +950,17 @@ class App(ctk.CTk):
     def _fire_stop(self):
         self.events.put(('stop',))
 
+    def _fire_random(self):
+        self.events.put(('random',))
+
     def _tick(self):
         try:
             while True:
                 evt = self.events.get_nowait()
                 if evt[0] == 'play':
-                    self.play_path(evt[1])
+                    self.play_path(evt[1], from_hotkey=True)
+                elif evt[0] == 'random':
+                    self.play_random(from_hotkey=True)
                 elif evt[0] == 'stop':
                     self.stop_all()
         except queue.Empty:
@@ -1039,6 +1141,113 @@ class App(ctk.CTk):
                       command=search).pack(side='left', padx=(10, 0))
         entry.bind('<Return>', search)
         set_note('▶ = ฟังตัวอย่างทางหูฟัง (ไม่เข้าเกม)   ⭳ = บันทึกลง sounds/ แล้วเพิ่มเข้ารายการ')
+
+    # ---------------------------------------------------------------- settings
+    def _apply_sound_processing(self):
+        self.engine.cache.set_processing(bool(self.config_data.get('trim_silence', True)),
+                                         bool(self.config_data.get('normalize', True)))
+        self.engine.cache.budget = int(self.config_data.get('cache_mb', 40)) * 1024 * 1024
+
+    def open_settings(self):
+        win = self._dialog('ตั้งค่า', 560, 700, modal=False)
+        ctk.CTkLabel(win, text='ตั้งค่า', font=T.font(19, 'bold'), text_color=T.TEXT).pack(pady=(18, 8))
+        body = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12,
+                            border_width=1, border_color=T.BORDER)
+        body.pack(fill='both', expand=True, padx=20, pady=(0, 18))
+
+        def section(title, note=None):
+            ctk.CTkLabel(body, text=title, font=T.font(14, 'bold'),
+                         text_color=T.TEXT).pack(anchor='w', padx=18, pady=(14, 0))
+            if note:
+                ctk.CTkLabel(body, text=note, font=T.font(12), text_color=T.TEXT_FAINT,
+                             justify='left').pack(anchor='w', padx=18)
+
+        def switch(text, key, on_change=None, state='normal', default=True):
+            var = ctk.BooleanVar(value=bool(self.config_data.get(key, default)))
+
+            def changed():
+                self.config_data[key] = bool(var.get())
+                if on_change:
+                    on_change(bool(var.get()))
+                self.save_config()
+
+            sw = ctk.CTkSwitch(body, text=text, variable=var, command=changed, font=T.font(13),
+                               text_color=T.TEXT_DIM, progress_color=T.PURPLE, fg_color=T.INPUT,
+                               button_color=T.TEXT, button_hover_color=T.PINK, state=state)
+            sw.pack(anchor='w', padx=18, pady=(8, 0))
+            return var, sw
+
+        section('ประมวลผลเสียง', 'ทำครั้งเดียวตอนโหลดไฟล์ ไม่เพิ่มงานตอนเล่น')
+        switch('ตัดช่วงเงียบหัวท้าย — กดแล้วเสียงออกทันที', 'trim_silence',
+               lambda _v: self._apply_sound_processing())
+        switch('ปรับทุกเสียงให้ดังพอ ๆ กัน', 'normalize', lambda _v: self._apply_sound_processing())
+
+        section('กันสแปม', 'เว้นระยะขั้นต่ำระหว่างเสียงที่กดจากคีย์ลัด (กดในหน้าต่างไม่ถูกจำกัด)')
+        gaps = {'ปิด': 0.0, '1 วิ': 1.0, '2 วิ': 2.0, '3 วิ': 3.0, '5 วิ': 5.0}
+        now = float(self.config_data.get('cooldown') or 0)
+        gap_var = ctk.StringVar(value=next((k for k, v in gaps.items() if v == now), '2 วิ'))
+
+        def gap_changed(label):
+            self.config_data['cooldown'] = gaps[label]
+            self.save_config()
+
+        gap_row = ToggleGroup(body, list(gaps), gap_var, command=gap_changed)
+        for b in gap_row.buttons.values():
+            b.configure(width=70)
+        gap_row.pack(anchor='w', padx=18, pady=(8, 0))
+
+        section('ปุ่มสุ่มเสียง', 'คลิกเพื่อตั้งปุ่ม คลิกขวาเพื่อล้าง')
+        spec = self.config_data.get('random_hotkey') or ''
+        rand_btn = ctk.CTkButton(body, text=spec or '+ ตั้งปุ่ม', width=140, height=32,
+                                 corner_radius=8, font=T.font(13, 'bold' if spec else 'normal'),
+                                 fg_color=T.BLUE if spec else 'transparent',
+                                 hover_color=T.BLUE_DARK if spec else T.SURFACE_3, border_width=1,
+                                 border_color=T.BORDER,
+                                 text_color=T.ON_ACCENT if spec else T.TEXT_DIM)
+        rand_btn.pack(anchor='w', padx=18, pady=(8, 0))
+
+        def set_random(new_spec):
+            self.config_data['random_hotkey'] = new_spec
+            self.apply_hotkeys()
+            self.save_config()
+            rand_btn.configure(text=new_spec or '+ ตั้งปุ่ม',
+                               fg_color=T.BLUE if new_spec else 'transparent',
+                               hover_color=T.BLUE_DARK if new_spec else T.SURFACE_3,
+                               text_color=T.ON_ACCENT if new_spec else T.TEXT_DIM)
+
+        rand_btn.configure(command=lambda: self._capture(set_random))
+        rand_btn.bind('<Button-3>', lambda _e: set_random(''))
+
+        section('เปิดพร้อม Windows', 'เปิดเครื่องแล้วรอใน tray เลย ไม่มีหน้าต่างเด้ง'
+                if autostart.supported() else 'ใช้ได้เฉพาะตอนรันจาก SoundSaoTer.exe')
+
+        def toggle_autostart(on):
+            try:
+                autostart.enable() if on else autostart.disable()
+                self.say('จะเปิดพร้อม Windows แล้ว' if on else 'ยกเลิกการเปิดพร้อม Windows แล้ว', T.OK)
+            except Exception as exc:
+                self.say(f'ตั้งค่าไม่สำเร็จ: {exc}', T.DANGER)
+
+        self.config_data['autostart'] = autostart.enabled()
+        switch('เปิดพร้อม Windows', 'autostart', toggle_autostart,
+               state='normal' if autostart.supported() else 'disabled', default=False)
+
+        section('หน่วยความจำ')
+        mem = ctk.CTkLabel(body, text='', font=T.font(13), text_color=T.TEXT_DIM)
+        mem.pack(anchor='w', padx=18, pady=(4, 0))
+
+        def show_mem():
+            used, budget, n = self.engine.cache.usage()
+            mem.configure(text=f'เสียงในแรม {used / 1048576:.1f} / {budget / 1048576:.0f} MB  ({n} ชุด)')
+
+        def clear_cache():
+            self.engine.cache.clear()
+            show_mem()
+
+        show_mem()
+        ctk.CTkButton(body, text='ล้างเสียงในแรม', width=140, height=30, corner_radius=8,
+                      font=T.font(12), fg_color=T.INPUT, hover_color=T.SURFACE_3,
+                      text_color=T.TEXT_DIM, command=clear_cache).pack(anchor='w', padx=18, pady=(6, 16))
 
     # ---------------------------------------------------------------- themes
     def open_theme_picker(self):
@@ -1226,6 +1435,7 @@ class App(ctk.CTk):
         if self._scanned:
             self.save_config()
         self.config_data['theme'] = T.NAME
+        self._apply_sound_processing()
         self._restore_widgets()
 
     def _restore_widgets(self):
