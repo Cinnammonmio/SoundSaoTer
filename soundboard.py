@@ -40,6 +40,7 @@ import autostart
 import random
 import re
 import time
+import webbrowser
 import updater
 import version as ver
 
@@ -849,6 +850,8 @@ class App(ctk.CTk):
         stem = sound['name']
         if re.match(r'^\d+ - ', stem):
             return 'Dota'
+        if re.search(r'\[td\d+\]$', stem):
+            return 'TiengDong'
         if re.search(r'\[\d+\]$', stem):
             return 'Myinstants'
         return 'ของฉัน'
@@ -869,10 +872,10 @@ class App(ctk.CTk):
         chips.pack(fill='x', padx=20, pady=(10, 6))
         src_var = ctk.StringVar(value='ทั้งหมด')
         free_var = ctk.BooleanVar(value=False)
-        group = ToggleGroup(chips, ['ทั้งหมด', 'Dota', 'Myinstants', 'ของฉัน'], src_var,
+        group = ToggleGroup(chips, ['ทั้งหมด', 'Dota', 'Myinstants', 'TiengDong', 'ของฉัน'], src_var,
                             command=lambda _v: schedule())
         for b in group.buttons.values():
-            b.configure(width=92, height=32)
+            b.configure(width=84, height=32)
         group.pack(side='left')
         ctk.CTkCheckBox(chips, text='ซ่อนที่อยู่ใน slot แล้ว', variable=free_var,
                         command=lambda: schedule(), font=T.font(12), text_color=T.TEXT_DIM,
@@ -1327,14 +1330,46 @@ class App(ctk.CTk):
         entry.pack(side='left', fill='x', expand=True)
         entry.focus_set()
 
+        cat_var = ctk.StringVar(value='')
+        cat_menu = ctk.CTkOptionMenu(
+            head, variable=cat_var, values=['-'], width=170, height=42, corner_radius=9,
+            font=T.font(13), dropdown_font=T.font(13), fg_color=T.INPUT, button_color=T.INPUT,
+            button_hover_color=T.SURFACE_3, dropdown_fg_color=T.SURFACE_2,
+            dropdown_hover_color=T.SURFACE_3, text_color=T.TEXT, dropdown_text_color=T.TEXT,
+            dynamic_resizing=False, command=lambda _v: search())
+        web_btn = ctk.CTkButton(
+            head, text='🌐', width=44, height=42, corner_radius=9, font=T.font(16),
+            fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+            command=lambda: open_in_browser())
+
         def current_source():
             return src.BY_LABEL[site_var.get()]
+
+        def has_categories(source):
+            return bool(getattr(source, 'CATEGORIES', None))
+
+        def open_in_browser():
+            source = current_source()
+            webbrowser.open(source.search_url(entry.get().strip()))
+            set_note('เปิดหน้าค้นหาในเบราว์เซอร์แล้ว — เจอเสียงที่ชอบ ก๊อปลิงก์หน้าเสียงมาวางที่ช่องนี้ได้')
 
         def on_site():
             source = current_source()
             entry.configure(placeholder_text=source.hint)
             clear()
-            set_note(f'ค้นหาใน {source.label} — {source.hint}')
+            if has_categories(source):
+                names = [c[0] for c in source.CATEGORIES]
+                cat_menu.configure(values=names)
+                cat_var.set(source.category if source.category in names else names[0])
+                search_btn.pack_forget()
+                cat_menu.pack(side='left', padx=(10, 0))
+                web_btn.pack(side='left', padx=(8, 0))
+                search()                               # เปิดมาก็เห็นเสียงเลย
+            else:
+                cat_menu.pack_forget()
+                web_btn.pack_forget()
+                search_btn.pack(side='left', padx=(10, 0))
+                set_note(f'ค้นหาใน {source.label} — {source.hint}')
 
         results = ctk.CTkScrollableFrame(win, fg_color=T.SURFACE, corner_radius=12,
                                          border_width=1, border_color=T.BORDER)
@@ -1444,10 +1479,13 @@ class App(ctk.CTk):
                 return
             needle = entry.get().strip()
             source = current_source()
-            if not needle:
+            if has_categories(source):
+                source.category = cat_var.get()
+            elif not needle:
                 return set_note(f'พิมพ์คำค้นก่อน — {source.hint}', T.WARN)
             state['busy'] = True
-            set_note(f'กำลังค้นหาใน {source.label} ...', T.WARN)
+            set_note(f'กำลังโหลด {source.label} · {cat_var.get()} ...' if has_categories(source)
+                     else f'กำลังค้นหาใน {source.label} ...', T.WARN)
 
             def worker():
                 try:
@@ -1461,10 +1499,22 @@ class App(ctk.CTk):
 
             threading.Thread(target=worker, daemon=True).start()
 
-        ctk.CTkButton(head, text='ค้นหา', width=104, height=42, corner_radius=9,
-                      font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PINK, hover_color=T.PINK_DARK,
-                      command=search).pack(side='left', padx=(10, 0))
+        search_btn = ctk.CTkButton(head, text='ค้นหา', width=104, height=42, corner_radius=9,
+                                   font=T.font(14, 'bold'), text_color=T.ON_ACCENT, fg_color=T.PINK,
+                                   hover_color=T.PINK_DARK, command=search)
+        search_btn.pack(side='left', padx=(10, 0))
         entry.bind('<Return>', search)
+
+        def live_filter():
+            # เว็บที่มีหมวด: กรองจากหน้าที่โหลดไว้แล้ว ไม่ยิงเว็บ พิมพ์ไปกรองไปได้เลย
+            source = current_source()
+            if has_categories(source) and not entry.get().strip().lower().startswith('http'):
+                job = state.get('job')
+                if job:
+                    win.after_cancel(job)
+                state['job'] = win.after(250, search)
+
+        watch_text(entry, live_filter)
         set_note('▶ = ฟังตัวอย่างทางหูฟัง (ไม่เข้าเกม)   ⭳ = บันทึกลง sounds/ แล้วเพิ่มเข้ารายการ')
 
     # ---------------------------------------------------------------- settings

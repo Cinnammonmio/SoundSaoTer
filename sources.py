@@ -1,7 +1,10 @@
-"""Sound sources the downloader can search: Dota 2 voice lines and Myinstants."""
+"""Sound sources the downloader can search: Dota 2 voice lines, Myinstants and TiengDong."""
 import html as html_mod
 import os
 import re
+import time
+import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -139,7 +142,169 @@ class MyInstants(Source):
         return f'{name} [{entry["id"]}]{ext}'
 
 
-SOURCES = [DotaVoiceLines(), MyInstants()]
+
+class Robots:
+    """robots.txt with Google-style wildcards.
+
+    urllib.robotparser treats '*' literally, so for rules like 'Disallow: *?s=*' it
+    wrongly says the URL is allowed. Longest matching rule wins; Allow wins a tie.
+    """
+
+    def __init__(self, text):
+        self.rules = []
+        applies = False
+        for raw in text.splitlines():
+            line = raw.split('#', 1)[0].strip()
+            if ':' not in line:
+                continue
+            field, value = (s.strip() for s in line.split(':', 1))
+            field = field.lower()
+            if field == 'user-agent':
+                applies = value == '*'
+            elif applies and field in ('allow', 'disallow') and value:
+                self.rules.append((field == 'allow', value, self._compile(value)))
+
+    @staticmethod
+    def _compile(pattern):
+        anchored = pattern.endswith('$')
+        body = pattern[:-1] if anchored else pattern
+        rx = ''.join('.*' if ch == '*' else re.escape(ch) for ch in body)
+        if not body.startswith('*'):
+            rx = '^' + rx
+        return re.compile(rx + ('$' if anchored else ''))
+
+    def allowed(self, url):
+        parts = urllib.parse.urlsplit(url)
+        target = (parts.path or '/') + (('?' + parts.query) if parts.query else '')
+        best = None
+        for allow, pattern, rx in self.rules:
+            if rx.search(target):
+                key = (len(pattern), allow)
+                if best is None or key > best[0]:
+                    best = (key, allow)
+        return True if best is None else best[1]
+
+
+class TiengDong(Source):
+    """tiengdong.com — its robots.txt forbids automated site search, so this source
+    only reads what it allows: the latest-sounds pages and the category (tag) pages.
+    Filtering by name happens here, on the pages already loaded."""
+
+    key = 'tiengdong'
+    label = 'TiengDong'
+    hint = 'เลือกหมวดด้านขวา แล้วพิมพ์เพื่อกรอง (ไม่ต้องใส่วรรณยุกต์) หรือวางลิงก์หน้าเสียงของเว็บ'
+    BASE = 'https://tiengdong.com'
+    PAGES = 3                      # หน้าละ ~60 เสียง (หน้าแรกซ้ำกับหน้า 2 ราว 40 ตัว)
+    DELAY = 0.6                    # เว้นจังหวะระหว่างหน้า ไม่รัวเซิร์ฟเวอร์เขา
+    CATEGORIES = [
+        ('ล่าสุด', ''),
+        ('มีม', 'am-thanh-meme'),
+        ('มีม (อังกฤษ)', 'meme-sound-effects'),
+        ('ตลก ขำขัน', 'vui-nhon-hai-huoc'),
+        ('เสียงหัวเราะ', 'tieng-cuoi'),
+        ('ประโยคไวรัล', 'cau-noi-viral'),
+        ('ตกใจ งง', 'bat-ngo-ngac-nhien'),
+        ('ลุ้นระทึก', 'cang-thang-hoi-hop'),
+        ('สยองขวัญ', 'am-thanh-kinh-di'),
+        ('การ์ตูน', 'am-thanh-hoat-hinh'),
+        ('ต่อสู้', 'am-thanh-danh-nhau'),
+        ('ปืน', 'tieng-sung'),
+        ('กิน ดื่ม', 'tieng-an-uong'),
+        ('ในครัว', 'tieng-trong-nha-bep'),
+        ('เอฟเฟกต์ทั่วไป', 'sound-effect'),
+        ('ริงโทน', 'nhac-chuong'),
+        ('เพลงประกอบ', 'nhac-nen-video'),
+    ]
+    ITEM_RE = re.compile(
+        r'data-post-id="(?P<id>\d+)"[^>]*?onclick="playPauseAudio\(\'[^\']*\',\s*\'(?P<url>[^\']+?\.mp3)\'\)'
+        r'[\s\S]*?<a href="(?P<page>[^"]+)"[^>]*>\s*(?P<name>[^<]+?)\s*</a>')
+    # หน้าของเสียงแต่ละตัว: เสียงหลักอยู่ในเครื่องเล่น <audio> ไม่ได้อยู่ในรายการ
+    MAIN_RE = re.compile(r'<audio[^>]*id="audio-(?P<id>\d+)-[^"]*"[\s\S]*?<source[^>]*src="(?P<url>[^"?]+\.mp3)')
+    H1_RE = re.compile(r'<h1[^>]*>([\s\S]*?)</h1>')
+
+    def __init__(self):
+        self.category = self.CATEGORIES[0][0]
+        self._robots = None
+        self._pages = {}           # url -> [entries]
+
+    # -- polite, robots-aware fetching --
+    def robots(self):
+        if self._robots is None:
+            self._robots = Robots(fetch(self.BASE + '/robots.txt'))
+        return self._robots
+
+    def _get(self, url):
+        if not url.startswith(self.BASE):
+            raise ValueError('ลิงก์นี้ไม่ใช่ของ tiengdong.com')
+        if not self.robots().allowed(url):
+            raise PermissionError('เว็บนี้ไม่อนุญาตให้โปรแกรมเปิดหน้านี้ (robots.txt) — '
+                                  'ถ้าเป็นหน้าค้นหา ใช้ปุ่มเปิดในเบราว์เซอร์แทน')
+        if url not in self._pages:
+            if self._pages:
+                time.sleep(self.DELAY)
+            self._pages[url] = self._parse(fetch(url))
+        return self._pages[url]
+
+    def _parse(self, page):
+        out = []
+        main = self.MAIN_RE.search(page)
+        if main:
+            title = self.H1_RE.search(page)
+            name = re.sub(r'<[^>]+>', '', title.group(1)) if title else main.group('id')
+            out.append({'id': 'td' + main.group('id'), 'text': html_mod.unescape(name).strip(),
+                        'creator': 'tiengdong', 'url': main.group('url'), 'page': ''})
+        for m in self.ITEM_RE.finditer(page):
+            url = m.group('url')
+            out.append({'id': 'td' + m.group('id'),
+                        'text': html_mod.unescape(m.group('name')).strip(),
+                        'creator': 'tiengdong',
+                        'url': url if url.startswith('http') else self.BASE + url,
+                        'page': m.group('page')})
+        return out
+
+    def category_urls(self, label):
+        slug = dict(self.CATEGORIES).get(label, '')
+        root = f'{self.BASE}/tag/{slug}' if slug else self.BASE
+        return [root] + [f'{root}/page/{n}' for n in range(2, self.PAGES + 1)]
+
+    def load_category(self, label=None):
+        entries = []
+        for url in self.category_urls(label or self.category):
+            try:
+                found = self._get(url)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404 and entries:      # หมวดเล็ก มีหน้าเดียว
+                    break
+                raise
+            if not found:
+                break
+            entries += found
+        return MyInstants._dedupe(entries)
+
+    def search_url(self, query):
+        """For the 'open in browser' button — a person searching is fine, a bot is not."""
+        return f'{self.BASE}/?s={urllib.parse.quote(query)}'
+
+    def search(self, query):
+        query = (query or '').strip()
+        if query.lower().startswith('http'):
+            return MyInstants._dedupe(self._get(query))
+        entries = self.load_category()
+        words = fold(query).split()
+        return [e for e in entries if all(w in fold(e['text']) for w in words)]
+
+    def filename(self, entry):
+        name = clean(entry['text']) or entry['id']
+        return f'{name} [{entry["id"]}].mp3'
+
+
+def fold(text):
+    """Lower-case and strip accents, so 'cuoi' finds 'cười' and 'dan' finds 'đàn'."""
+    text = unicodedata.normalize('NFKD', (text or '').lower().replace('đ', 'd'))
+    return ''.join(ch for ch in text if not unicodedata.combining(ch))
+
+
+SOURCES = [DotaVoiceLines(), MyInstants(), TiengDong()]
 BY_KEY = {s.key: s for s in SOURCES}
 BY_LABEL = {s.label: s for s in SOURCES}
 
