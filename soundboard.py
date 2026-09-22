@@ -38,6 +38,7 @@ import theme as T
 import tray as tray_mod
 import autostart
 import random
+import re
 import time
 import updater
 import version as ver
@@ -49,6 +50,8 @@ PREVIEW_DIR = os.path.join(tempfile.gettempdir(), 'SoundSaoTer_preview')
 AUDIO_EXT = ('.wav', '.mp3', '.ogg', '.flac', '.aiff', '.aif', '.w64')
 NONE_LABEL = '— ไม่ใช้ —'
 MAX_ROWS = 250
+DEFAULT_SLOTS = 8
+PICKER_ROWS = 40
 
 
 
@@ -60,8 +63,22 @@ def default_config():
         'stop_hotkey': 'ctrl+alt+s', 'sounds': [],
         'hear_self': False, 'auto_update': True, 'theme': T.DEFAULT,
         'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
-        'cache_mb': 40,
+        'cache_mb': 40, 'slots': [], 'view': 'slots',
     }
+
+
+def watch_text(entry, callback):
+    """Call back on every change to the text — typing, pasting with the mouse, anything.
+
+    <KeyRelease> alone misses a right-click paste. The variable is seeded with what the
+    entry shows now so CustomTkinter's placeholder stays visible; entry.get() still
+    returns '' while the placeholder is up, so callers never filter by the hint text.
+    """
+    var = tk.StringVar(master=entry, value=entry._entry.get())
+    entry._entry.configure(textvariable=var)
+    var.trace_add('write', lambda *_: callback())
+    entry._watch_var = var          # keep a reference or Tk drops the trace
+    return var
 
 
 def peek_theme():
@@ -147,17 +164,15 @@ class SoundRow(ctk.CTkFrame):
         # เลื่อนล้อเมาส์บนปุ่ม = ปรับทีละ 5%  (ไม่สร้าง slider ค้างไว้ทุกแถว ประหยัดแรม)
         self.vol_chip.bind('<MouseWheel>', lambda e: app.nudge_volume(index, 5 if e.delta > 0 else -5))
 
-        spec = data.get('hotkey')
-        self.badge = ctk.CTkButton(
-            self, text=spec or '+ ตั้งปุ่ม', width=126, height=32, corner_radius=8,
-            font=T.font(14, 'bold' if spec else 'normal'),
-            fg_color=T.BLUE if spec else 'transparent',
-            hover_color=T.BLUE_DARK if spec else T.SURFACE_3,
-            border_width=0 if spec else 1, border_color=T.BORDER,
-            text_color=T.ON_ACCENT if spec else T.TEXT_DIM,
-            command=lambda: app.set_hotkey(index))
-        self.badge.pack(side='right', padx=6)
-        self.badge.bind('<Button-3>', lambda e: app.clear_hotkey(index))
+        slots = app.slots_using(data['path'])
+        if slots:
+            ctk.CTkLabel(self, text='slot ' + ', '.join(str(n) for n in slots), font=T.font(12),
+                         text_color=T.PURPLE, width=70).pack(side='right', padx=4)
+        else:
+            ctk.CTkButton(self, text='＋ slot', width=70, height=32, corner_radius=8,
+                          font=T.font(13), fg_color='transparent', hover_color=T.SURFACE_3,
+                          border_width=1, border_color=T.BORDER, text_color=T.TEXT_DIM,
+                          command=lambda: app.add_to_slot(data['path'])).pack(side='right', padx=4)
 
         for widget in (self, self.name):
             widget.bind('<Enter>', self._on_enter)
@@ -169,6 +184,61 @@ class SoundRow(ctk.CTkFrame):
 
     def _on_leave(self, _=None):
         self.configure(fg_color=T.SURFACE_2)
+
+    def flash(self):
+        self.play.configure(fg_color=T.PINK)
+        self.after(400, lambda: self.play.configure(fg_color=T.PURPLE))
+
+
+class SlotRow(ctk.CTkFrame):
+    """One slot: number, hotkey, the sound it plays. Slot 1 is always random."""
+
+    def __init__(self, master, app, number, slot=None):
+        super().__init__(master, fg_color=T.SURFACE_2, corner_radius=10, height=58)
+        self.pack_propagate(False)
+        self.app, self.number, self.slot = app, number, slot
+        is_random = slot is None
+        spec = app.config_data.get('random_hotkey') if is_random else slot.get('hotkey')
+
+        ctk.CTkLabel(self, text='🎲' if is_random else str(number), width=38, height=38,
+                     corner_radius=19, font=T.font(15, 'bold'),
+                     fg_color=T.PINK if is_random else T.INPUT,
+                     text_color=T.ON_ACCENT if is_random else T.TEXT_DIM).pack(side='left', padx=(8, 10))
+
+        self.badge = ctk.CTkButton(
+            self, text=spec or '+ ตั้งปุ่ม', width=126, height=32, corner_radius=8,
+            font=T.font(14, 'bold' if spec else 'normal'),
+            fg_color=T.BLUE if spec else 'transparent',
+            hover_color=T.BLUE_DARK if spec else T.SURFACE_3,
+            border_width=0 if spec else 1, border_color=T.BORDER,
+            text_color=T.ON_ACCENT if spec else T.TEXT_DIM,
+            command=lambda: app.set_slot_hotkey(number))
+        self.badge.pack(side='left', padx=(0, 10))
+        self.badge.bind('<Button-3>', lambda e: app.clear_slot_hotkey(number))
+
+        if is_random:
+            n = len(app._rows())
+            ctk.CTkLabel(self, text=f'สุ่มจากคลังเสียงทั้งหมด ({n} เสียง)', anchor='w',
+                         font=T.font(15), text_color=T.TEXT).pack(side='left', fill='x', expand=True)
+        else:
+            sound = app.sound_by_path(slot.get('path'))
+            self.pick = ctk.CTkButton(
+                self, text=(sound['name'] if sound else '—  กดเพื่อเลือกเสียง  —'), anchor='w',
+                height=36, corner_radius=8, font=T.font(15),
+                fg_color='transparent', hover_color=T.SURFACE_3,
+                text_color=T.TEXT if sound else T.TEXT_FAINT,
+                command=lambda: app.pick_sound(number))
+            self.pick.pack(side='left', fill='x', expand=True)
+
+        ctk.CTkButton(self, text='✕', width=34, height=34, corner_radius=8, font=T.font(14),
+                      fg_color='transparent', hover_color=T.DANGER, text_color=T.TEXT_FAINT,
+                      state='disabled' if is_random else 'normal',
+                      command=lambda: app.remove_slot(number)).pack(side='right', padx=(4, 8))
+        self.play = ctk.CTkButton(
+            self, text='▶', width=38, height=38, corner_radius=19, font=T.font(15),
+            fg_color=T.PURPLE, hover_color=T.PURPLE_DARK, text_color=T.ON_ACCENT,
+            command=lambda: app.play_slot(number))
+        self.play.pack(side='right', padx=4)
 
     def flash(self):
         self.play.configure(fg_color=T.PINK)
@@ -402,17 +472,12 @@ class App(ctk.CTk):
         bar = ctk.CTkFrame(self, fg_color='transparent')
         bar.grid(row=2, column=0, sticky='nsew', padx=22)
         bar.grid_columnconfigure(0, weight=1)
-        bar.grid_rowconfigure(1, weight=1)
+        bar.grid_rowconfigure(2, weight=1)
 
         top = ctk.CTkFrame(bar, fg_color='transparent')
         top.grid(row=0, column=0, sticky='ew', pady=(0, 10))
-        self.search = ctk.CTkEntry(top, placeholder_text='ค้นหาเสียง...', width=270, height=40,
-                                   corner_radius=9, font=T.font(14), fg_color=T.INPUT,
-                                   border_color=T.BORDER, text_color=T.TEXT)
-        self.search.pack(side='left')
-        self.search.bind('<KeyRelease>', lambda e: self.redraw())
-
         self.sw_excl = self._switch(top, 'เล่นทีละเสียง', self.apply_options, True)
+        self.sw_excl.pack_configure(padx=(0, 0))
         self.sw_hk = self._switch(top, 'ฮอตคีย์', self.apply_hotkeys, True)
         self.sw_mute = self._switch(top, 'ปิดไมค์', self.apply_mic_mute, False)
         self.sw_tray = self._switch(top, 'ย่อลง tray', self.apply_tray_option, True)
@@ -427,11 +492,25 @@ class App(ctk.CTk):
             command=self.set_stop_hotkey)
         self.stop_badge.pack(side='right', padx=8)
 
+        tabs = ctk.CTkFrame(bar, fg_color='transparent')
+        tabs.grid(row=1, column=0, sticky='ew', pady=(0, 8))
+        self.view_var = ctk.StringVar(value='slots')
+        self.view_tabs = ToggleGroup(tabs, ['🎯  ช่องคีย์ลัด', '📚  คลังเสียง'], self.view_var,
+                                     command=lambda _v: self.switch_view())
+        for b in self.view_tabs.buttons.values():
+            b.configure(width=150)
+        self.view_tabs.pack(side='left')
+        self.search = ctk.CTkEntry(tabs, placeholder_text='ค้นหาเสียง...', width=270, height=38,
+                                   corner_radius=9, font=T.font(14), fg_color=T.INPUT,
+                                   border_color=T.BORDER, text_color=T.TEXT)
+        self.search.pack(side='right')
+        watch_text(self.search, self._schedule_redraw)
+
         # ---- list
         self.list = ctk.CTkScrollableFrame(
             bar, fg_color=T.SURFACE, corner_radius=14, border_width=1, border_color=T.BORDER,
             scrollbar_button_color=T.SURFACE_3, scrollbar_button_hover_color=T.PURPLE)
-        self.list.grid(row=1, column=0, sticky='nsew')
+        self.list.grid(row=2, column=0, sticky='nsew')
 
         self.empty = ctk.CTkLabel(
             self.list, justify='center', font=T.font(15), text_color=T.TEXT_FAINT,
@@ -444,7 +523,6 @@ class App(ctk.CTk):
             ('+  เพิ่มไฟล์', self.add_files, T.PURPLE, T.PURPLE_DARK),
             ('+  เพิ่มทั้งโฟลเดอร์', self.add_folder, T.INPUT, T.SURFACE_3),
             ('⭳  โหลดเสียงจากเว็บ', self.open_downloader, T.PINK, T.PINK_DARK),
-            ('🎲  สุ่มเสียง', lambda: self.play_random(from_hotkey=False), T.BLUE, T.BLUE_DARK),
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
@@ -595,13 +673,48 @@ class App(ctk.CTk):
     def _rows(self):
         return self.config_data['sounds']
 
+    def _schedule_redraw(self):
+        job = getattr(self, '_redraw_job', None)
+        if job:
+            self.after_cancel(job)
+        self._redraw_job = self.after(150, self.redraw)
+
+    def switch_view(self):
+        self.config_data['view'] = 'library' if 'คลัง' in self.view_var.get() else 'slots'
+        self.save_config()
+        self.redraw()
+
+    def _add_btn(self, text, cmd):
+        btn = ctk.CTkButton(self.list, text=text, height=40, corner_radius=10, font=T.font(14),
+                            fg_color='transparent', hover_color=T.SURFACE_3, border_width=1,
+                            border_color=T.BORDER, text_color=T.TEXT_DIM, command=cmd)
+        btn.pack(fill='x', padx=10, pady=(6, 10))
+        self.rows.append(btn)
+
     def redraw(self):
         for row in self.rows:
             row.destroy()
         self.rows = []
         self.empty.pack_forget()
-
         needle = self.search.get().strip().lower()
+
+        if self.config_data.get('view', 'slots') == 'slots':
+            if not needle or 'สุ่ม' in needle:
+                row = SlotRow(self.list, self, 1)
+                row.pack(fill='x', padx=10, pady=4)
+                self.rows.append(row)
+            for n, slot in enumerate(self.config_data['slots'], start=2):
+                sound = self.sound_by_path(slot.get('path'))
+                if needle and needle not in (sound['name'].lower() if sound else '') \
+                        and needle != (slot.get('hotkey') or '').lower():
+                    continue
+                row = SlotRow(self.list, self, n, slot)
+                row.pack(fill='x', padx=10, pady=4)
+                self.rows.append(row)
+            if not needle:
+                self._add_btn('＋  เพิ่ม slot', self.add_slot)
+            return
+
         shown = 0
         for i, data in enumerate(self._rows()):
             if needle and needle not in data['name'].lower():
@@ -614,10 +727,221 @@ class App(ctk.CTk):
             shown += 1
 
         if not self._rows():
+            self.empty.configure(text='ยังไม่มีเสียงในคลัง\n\nกด "เพิ่มไฟล์" หรือ "โหลดเสียงจากเว็บ" ด้านล่าง')
             self.empty.pack(pady=60)
         elif shown == 0:
             self.empty.configure(text=f'ไม่พบเสียงที่ตรงกับ "{self.search.get()}"')
             self.empty.pack(pady=60)
+
+    # ---------------------------------------------------------------- slots
+    def sound_by_path(self, path):
+        if not path:
+            return None
+        key = self._key(path)
+        return next((s for s in self._rows() if self._key(s['path']) == key), None)
+
+    def slots_using(self, path):
+        key = self._key(path)
+        return [n for n, s in enumerate(self.config_data['slots'], start=2)
+                if s.get('path') and self._key(s['path']) == key]
+
+    def _slot(self, number):
+        """number 2.. -> the slot dict (slot 1 is the random slot and has none)"""
+        return self.config_data['slots'][number - 2]
+
+    def _slots_changed(self, message=None, tone=None):
+        self.save_config()
+        self.apply_hotkeys()
+        self.redraw()
+        if message:
+            self.say(message, tone or T.OK)
+
+    def add_slot(self):
+        self.config_data['slots'].append({'hotkey': '', 'path': ''})
+        self._slots_changed()
+
+    def remove_slot(self, number):
+        slot = self._slot(number)
+        del self.config_data['slots'][number - 2]
+        self._slots_changed(f"ลบ slot {number}" + (f" ({slot['hotkey']})" if slot.get('hotkey') else ''))
+
+    def add_to_slot(self, path):
+        """From the library: drop the sound into the first empty slot, making one if needed."""
+        slots = self.config_data['slots']
+        free = next((i for i, s in enumerate(slots) if not s.get('path')), None)
+        if free is None:
+            slots.append({'hotkey': '', 'path': ''})
+            free = len(slots) - 1
+        slots[free]['path'] = path
+        self._slots_changed(f'ใส่ลง slot {free + 2} แล้ว — ไปตั้งปุ่มได้ที่แท็บ "ช่องคีย์ลัด"')
+
+    def play_slot(self, number):
+        if number == 1:
+            return self.play_random()
+        sound = self.sound_by_path(self._slot(number).get('path'))
+        if sound is None:
+            return self.pick_sound(number)
+        self.play_path(sound['path'])
+
+    def _hotkey_owner(self, spec):
+        if spec and self.config_data.get('random_hotkey') == spec:
+            return 1
+        for n, s in enumerate(self.config_data['slots'], start=2):
+            if spec and s.get('hotkey') == spec:
+                return n
+        return None
+
+    def set_slot_hotkey(self, number):
+        def done(spec):
+            if spec == self.config_data.get('stop_hotkey'):
+                return self.say(f'{spec} ใช้เป็นปุ่มหยุดเสียงอยู่แล้ว', T.WARN)
+            owner = self._hotkey_owner(spec)
+            if owner and owner != number:          # ปุ่มเดียวกันใช้ได้ที่เดียว
+                self._write_slot_hotkey(owner, '')
+            self._write_slot_hotkey(number, spec)
+            note = f' (ย้ายมาจาก slot {owner})' if owner and owner != number else ''
+            self._slots_changed(f'slot {number} = {spec}{note}')
+
+        self._capture(done)
+
+    def clear_slot_hotkey(self, number):
+        self._write_slot_hotkey(number, '')
+        self._slots_changed(f'ล้างปุ่มของ slot {number} แล้ว')
+
+    def _write_slot_hotkey(self, number, spec):
+        if number == 1:
+            self.config_data['random_hotkey'] = spec
+        else:
+            self._slot(number)['hotkey'] = spec
+
+    def _migrate_slots(self):
+        """Up to v1.2 hotkeys lived on the sounds; move them into slots, in key order."""
+        sounds = self._rows()
+        if not self.config_data.get('slots'):
+            keyed = [s for s in sounds if s.get('hotkey')]
+            natural = lambda s: [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', s['hotkey'])]
+            self.config_data['slots'] = [{'hotkey': s['hotkey'], 'path': s['path']}
+                                         for s in sorted(keyed, key=natural)]
+            while len(self.config_data['slots']) < DEFAULT_SLOTS:
+                self.config_data['slots'].append({'hotkey': '', 'path': ''})
+        for s in sounds:
+            s.pop('hotkey', None)
+        for slot in self.config_data['slots']:
+            slot.setdefault('hotkey', '')
+            slot.setdefault('path', '')
+            if slot['path'] and self.sound_by_path(slot['path']) is None:
+                slot['path'] = ''                # ไฟล์หายไปแล้ว เก็บปุ่มไว้ ล้างแค่เสียง
+
+    # ---------------------------------------------------------------- sound picker
+    @staticmethod
+    def _source_of(sound):
+        stem = sound['name']
+        if re.match(r'^\d+ - ', stem):
+            return 'Dota'
+        if re.search(r'\[\d+\]$', stem):
+            return 'Myinstants'
+        return 'ของฉัน'
+
+    def pick_sound(self, number):
+        slot = self._slot(number)
+        win = self._dialog(f'เลือกเสียงให้ slot {number}', 700, 640, modal=False)
+        ctk.CTkLabel(win, text=f'เลือกเสียงให้ slot {number}' +
+                     (f"  ·  {slot['hotkey']}" if slot.get('hotkey') else ''),
+                     font=T.font(17, 'bold'), text_color=T.TEXT).pack(pady=(18, 10))
+
+        entry = ctk.CTkEntry(win, placeholder_text='พิมพ์ชื่อเสียง… (Enter = เลือกอันแรก)', height=40,
+                             corner_radius=9, font=T.font(14), fg_color=T.INPUT,
+                             border_color=T.BORDER, text_color=T.TEXT)
+        entry.pack(fill='x', padx=20)
+
+        chips = ctk.CTkFrame(win, fg_color='transparent')
+        chips.pack(fill='x', padx=20, pady=(10, 6))
+        src_var = ctk.StringVar(value='ทั้งหมด')
+        free_var = ctk.BooleanVar(value=False)
+        group = ToggleGroup(chips, ['ทั้งหมด', 'Dota', 'Myinstants', 'ของฉัน'], src_var,
+                            command=lambda _v: schedule())
+        for b in group.buttons.values():
+            b.configure(width=92, height=32)
+        group.pack(side='left')
+        ctk.CTkCheckBox(chips, text='ซ่อนที่อยู่ใน slot แล้ว', variable=free_var,
+                        command=lambda: schedule(), font=T.font(12), text_color=T.TEXT_DIM,
+                        fg_color=T.PURPLE, hover_color=T.PURPLE_DARK, border_color=T.BORDER,
+                        checkmark_color=T.ON_ACCENT).pack(side='right')
+
+        results = ctk.CTkScrollableFrame(win, fg_color=T.SURFACE, corner_radius=12,
+                                         border_width=1, border_color=T.BORDER)
+        results.pack(fill='both', expand=True, padx=20, pady=(4, 8))
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT)
+        note.pack(pady=(0, 12))
+        state = {'job': None, 'hits': []}
+
+        def matches():
+            needle = entry.get().strip().lower()
+            want = src_var.get()
+            used = {self._key(s['path']) for s in self.config_data['slots'] if s.get('path')}
+            out = []
+            for s in self._rows():
+                if needle and needle not in s['name'].lower():
+                    continue
+                if want != 'ทั้งหมด' and self._source_of(s) != want:
+                    continue
+                if free_var.get() and self._key(s['path']) in used:
+                    continue
+                out.append(s)
+            return out
+
+        def choose(sound):
+            slot['path'] = sound['path']
+            win.destroy()
+            self._slots_changed(f"slot {number} = {sound['name'][:40]}")
+
+        def render():
+            state['job'] = None
+            for w in results.winfo_children():
+                w.destroy()
+            hits = matches()
+            state['hits'] = hits
+            current = self._key(slot['path']) if slot.get('path') else None
+            for s in hits[:PICKER_ROWS]:
+                mine = current == self._key(s['path'])
+                row = ctk.CTkFrame(results, fg_color=T.SURFACE_3 if mine else T.SURFACE_2,
+                                   corner_radius=9, height=44)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                ctk.CTkButton(row, text='▶', width=34, height=30, corner_radius=8, font=T.font(12),
+                              fg_color='transparent', border_width=1, border_color=T.BORDER,
+                              hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                              command=lambda p=s['path']: self._preview_file(p)).pack(side='left', padx=(8, 6))
+                ctk.CTkButton(row, text=('✓  ' if mine else '') + s['name'], anchor='w', height=34,
+                              corner_radius=8, font=T.font(14), fg_color='transparent',
+                              hover_color=T.SURFACE_3, text_color=T.TEXT,
+                              command=lambda snd=s: choose(snd)).pack(side='left', fill='x', expand=True)
+                tag = self.slots_using(s['path'])
+                ctk.CTkLabel(row, text=(f"slot {', '.join(map(str, tag))}" if tag else self._source_of(s)),
+                             width=90, font=T.font(11), text_color=T.PURPLE if tag else T.TEXT_FAINT
+                             ).pack(side='right', padx=8)
+            more = len(hits) - PICKER_ROWS
+            note.configure(text=(f'พบ {len(hits)} เสียง' + (f' — แสดง {PICKER_ROWS} แรก พิมพ์เพิ่มเพื่อกรอง'
+                                                            if more > 0 else '') + '   ·   ▶ = ฟังทางหูฟัง ไม่เข้าเกม')
+                           if hits else 'ไม่พบเสียงที่ตรงกับตัวกรอง')
+
+        def schedule(*_):
+            # รอให้พิมพ์จบก่อนค่อยวาดใหม่ พิมพ์รัว ๆ จะได้ไม่หน่วง
+            if state['job']:
+                win.after_cancel(state['job'])
+            state['job'] = win.after(180, render)
+
+        watch_text(entry, schedule)
+        entry.bind('<Return>', lambda e: choose(state['hits'][0]) if state['hits'] else None)
+        render()
+        win.after(200, entry.focus_set)
+
+    def _preview_file(self, path):
+        try:
+            where = self.engine.preview(path)
+            self.say(f'ฟังตัวอย่างทาง {where} (ไม่เข้าเกม)', T.OK)
+        except Exception as exc:
+            self.say(str(exc), T.WARN)
 
     @staticmethod
     def _key(path):
@@ -675,6 +999,10 @@ class App(ctk.CTk):
     def remove_sound(self, index):
         if 0 <= index < len(self._rows()):
             name = self._rows()[index]['name']
+            gone = self._key(self._rows()[index]['path'])
+            for slot in self.config_data['slots']:
+                if slot.get('path') and self._key(slot['path']) == gone:
+                    slot['path'] = ''
             del self._rows()[index]
             self.redraw()
             self.apply_hotkeys()
@@ -879,29 +1207,11 @@ class App(ctk.CTk):
         win.protocol('WM_DELETE_WINDOW', lambda: finish(None))
         win.after(150, win.focus_force)
 
-    def set_hotkey(self, index):
-        row = self._rows()[index]
-
-        def done(spec):
-            for other in self._rows():
-                if other is not row and other.get('hotkey') == spec:
-                    other['hotkey'] = ''
-            row['hotkey'] = spec
-            self.redraw()
-            self.apply_hotkeys()
-            self.save_config()
-
-        self._capture(done)
-
-    def clear_hotkey(self, index):
-        self._rows()[index]['hotkey'] = ''
-        self.redraw()
-        self.apply_hotkeys()
-        self.save_config()
-        self.say('ล้างฮอตคีย์แล้ว')
-
     def set_stop_hotkey(self):
         def done(spec):
+            owner = self._hotkey_owner(spec)
+            if owner:
+                return self.say(f'{spec} ใช้กับ slot {owner} อยู่ — ล้างที่ slot ก่อน', T.WARN)
             self.config_data['stop_hotkey'] = spec
             self.stop_badge.configure(text=spec)
             self.apply_hotkeys()
@@ -919,7 +1229,11 @@ class App(ctk.CTk):
             return self.say('ปิดฮอตคีย์ชั่วคราวแล้ว', T.WARN)
 
         entries, specs, bad = [], [], []
-        wanted = [(r.get('hotkey'), partial(self._fire, r['path'])) for r in self._rows()]
+        wanted = []
+        for slot in self.config_data['slots']:
+            sound = self.sound_by_path(slot.get('path'))
+            if slot.get('hotkey') and sound is not None:
+                wanted.append((slot['hotkey'], partial(self._fire, sound['path'])))
         wanted.append((self.config_data.get('stop_hotkey'), self._fire_stop))
         wanted.append((self.config_data.get('random_hotkey'), self._fire_random))
         for spec, callback in wanted:
@@ -1196,28 +1510,6 @@ class App(ctk.CTk):
             b.configure(width=70)
         gap_row.pack(anchor='w', padx=18, pady=(8, 0))
 
-        section('ปุ่มสุ่มเสียง', 'คลิกเพื่อตั้งปุ่ม คลิกขวาเพื่อล้าง')
-        spec = self.config_data.get('random_hotkey') or ''
-        rand_btn = ctk.CTkButton(body, text=spec or '+ ตั้งปุ่ม', width=140, height=32,
-                                 corner_radius=8, font=T.font(13, 'bold' if spec else 'normal'),
-                                 fg_color=T.BLUE if spec else 'transparent',
-                                 hover_color=T.BLUE_DARK if spec else T.SURFACE_3, border_width=1,
-                                 border_color=T.BORDER,
-                                 text_color=T.ON_ACCENT if spec else T.TEXT_DIM)
-        rand_btn.pack(anchor='w', padx=18, pady=(8, 0))
-
-        def set_random(new_spec):
-            self.config_data['random_hotkey'] = new_spec
-            self.apply_hotkeys()
-            self.save_config()
-            rand_btn.configure(text=new_spec or '+ ตั้งปุ่ม',
-                               fg_color=T.BLUE if new_spec else 'transparent',
-                               hover_color=T.BLUE_DARK if new_spec else T.SURFACE_3,
-                               text_color=T.ON_ACCENT if new_spec else T.TEXT_DIM)
-
-        rand_btn.configure(command=lambda: self._capture(set_random))
-        rand_btn.bind('<Button-3>', lambda _e: set_random(''))
-
         section('เปิดพร้อม Windows', 'เปิดเครื่องแล้วรอใน tray เลย ไม่มีหน้าต่างเด้ง'
                 if autostart.supported() else 'ใช้ได้เฉพาะตอนรันจาก SoundSaoTer.exe')
 
@@ -1435,6 +1727,7 @@ class App(ctk.CTk):
         if self._scanned:
             self.save_config()
         self.config_data['theme'] = T.NAME
+        self._migrate_slots()
         self._apply_sound_processing()
         self._restore_widgets()
 
@@ -1450,6 +1743,8 @@ class App(ctk.CTk):
         self.var_hearself.set(bool(self.config_data.get('hear_self')))
         self.engine.set_monitor_self(self.var_hearself.get())   # applied when the mic starts
         self.engine.exclusive = self.config_data['exclusive']
+        self.view_var.set('📚  คลังเสียง' if self.config_data.get('view') == 'library' else '🎯  ช่องคีย์ลัด')
+        self.view_tabs._paint()
         self.redraw()
 
     def save_config(self):
