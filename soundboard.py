@@ -65,6 +65,7 @@ NONE_LABEL = '— ไม่ใช้ —'
 MAX_ROWS = 250
 DEFAULT_SLOTS = 8
 PICKER_ROWS = 40
+PREWARM_BYTES = 6 * 1024 * 1024    # decoded audio kept ready for hotkeys (~1 MB per second)
 
 
 
@@ -79,7 +80,7 @@ def default_config():
         'cache_mb': 40, 'slots': [], 'view': 'slots',
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
-        'remote_enabled': False, 'remote_key': '', 'remote_port': 8765,
+        'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
     }
 
 
@@ -152,6 +153,59 @@ def peek_theme():
 
 
 # --------------------------------------------------------------------------- widgets
+class EventBus:
+    """Everything that can start a sound posts here — hotkeys, the phone, the tray.
+
+    The sound itself starts on the playback thread straight away. Only the status
+    text and the row flash wait for the UI tick. Up to v1.10.0 the whole thing
+    queued for that tick, which put up to 80 ms between the key press and the
+    first sample.
+    """
+
+    AUDIO = ('play', 'slot', 'random', 'stop')
+
+    def __init__(self, app):
+        self.app = app
+        self._ui = queue.Queue()
+        self._audio = queue.Queue()
+        threading.Thread(target=self._run, name='playback', daemon=True).start()
+
+    def put(self, evt):
+        """Called from the hotkey thread, the phone's server thread or the UI."""
+        if evt[0] in self.AUDIO:
+            self.app._dispatch_audio(evt)
+        else:
+            self._ui.put(evt)
+
+    # -- what the playback thread should do
+    def play(self, path, gain):
+        self._audio.put(('play', path, gain))
+
+    def stop(self):
+        self._audio.put(('stop',))
+
+    # -- what the Tk thread should do (read by App._tick)
+    def note(self, text, tone=None):
+        self._ui.put(('note', text, tone))
+
+    def played(self, path):
+        self._ui.put(('played', path))
+
+    def get_nowait(self):
+        return self._ui.get_nowait()
+
+    def _run(self):
+        while True:
+            evt = self._audio.get()
+            try:
+                if evt[0] == 'play':
+                    self.app.engine.play(evt[1], gain=evt[2])
+                elif evt[0] == 'stop':
+                    self.app.engine.stop()
+            except Exception as exc:        # noqa: BLE001 — shown in the status line
+                self.note(f'เล่นไม่ได้: {exc}', T.DANGER)
+
+
 class ToggleGroup(ctk.CTkFrame):
     """Row of buttons where one is selected. Unlike CTkSegmentedButton each state gets
     its own text colour, so a selected neon-green segment can carry dark text."""
@@ -390,7 +444,7 @@ class App(ctk.CTk):
         self.engine = ae.Engine()
         self.devices, self.inputs = [], []
         self.config_data = default_config()
-        self.events = queue.Queue()
+        self.events = EventBus(self)
         self.capturing = False
         self.rows = []
         self.hotkey_error = ''
@@ -416,6 +470,7 @@ class App(ctk.CTk):
         self.load_config()
         self.refresh_devices(initial=True)
         self.apply_hotkeys()
+        self._prewarm_slots(600)
         if self.config_data.get('remote_enabled'):
             try:
                 self._start_remote()
@@ -872,6 +927,47 @@ class App(ctk.CTk):
         """number 2.. -> the slot dict (slot 1 is the random slot and has none)"""
         return self.config_data['slots'][number - 2]
 
+    def _prewarm_slots(self, delay=1200):
+        """Decode the sounds sitting in slots in the background: the first press of
+        each is then as fast as the rest (decoding one costs 3-30 ms)."""
+        job = getattr(self, '_warm_job', None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._warm_job = self.after(delay, self._do_prewarm)
+
+    def _do_prewarm(self):
+        self._warm_job = None
+        player = self.engine.players.get('game')
+        if player is None or not self.config_data.get('prewarm', True):
+            return
+        paths, seen = [], set()
+        # slots with a hotkey first: those are the ones pressed mid-game
+        slots = sorted(self.config_data.get('slots', []), key=lambda s: not s.get('hotkey'))
+        for slot in slots:
+            for p in slot.get('paths', []):
+                key = self._key(p)
+                if key not in seen and os.path.isfile(p):
+                    seen.add(key)
+                    paths.append(p)
+        if not paths:
+            return
+        rate, channels = player.samplerate, player.channels
+
+        def work():
+            spent = 0
+            for path in paths:
+                try:
+                    spent += self.engine.cache.get(path, rate, channels).nbytes
+                except Exception:
+                    continue
+                if spent > PREWARM_BYTES:     # decoded audio is ~1 MB per second
+                    break
+
+        threading.Thread(target=work, name='prewarm', daemon=True).start()
+
     def _slots_changed(self, message=None, tone=None):
         self.save_config()
         self.apply_hotkeys()
@@ -905,6 +1001,50 @@ class App(ctk.CTk):
         self._slot_cursor = {}
         self._slots_changed(f'slot {number}: ' +
                             ('เล่นวนตามลำดับ' if slot['mode'] == 'order' else 'สุ่มจากเสียงใน slot'))
+
+    def _dispatch_audio(self, evt):
+        """Runs on whichever thread posted the event — never touches Tk."""
+        kind = evt[0]
+        if kind == 'stop':
+            self.events.stop()
+            return self.events.note('หยุดเสียงแล้ว')
+        if kind == 'play':
+            path = evt[1]
+        elif kind == 'slot':
+            path = self._slot_path(evt[1])
+        else:
+            path = self._random_path()
+        if not path:
+            return
+        left = self._cooldown_left()
+        if left > 0:
+            return self.events.note(f'กันสแปม: รออีก {left:.1f} วินาที', T.WARN)
+        self._last_hotkey_play = time.monotonic()
+        self.events.play(path, self._sound_volume(path))
+        self.events.played(path)
+
+    def _slot_path(self, number):
+        try:
+            slot = self._slot(number)
+        except IndexError:
+            return None
+        sounds = self.slot_sounds(slot)
+        if not sounds:
+            self.events.note(f'slot {number} ยังไม่ได้ใส่เสียง', T.WARN)
+            return None
+        return self._pick_from_slot(number, slot, sounds)
+
+    def _random_path(self):
+        pool = [s['path'] for s in self._rows()]
+        if not pool:
+            self.events.note('ยังไม่มีเสียงให้สุ่ม', T.WARN)
+            return None
+        last = getattr(self, '_last_random', None)
+        if len(pool) > 1 and last in pool:
+            pool.remove(last)                # ไม่สุ่มซ้ำตัวเดิมติดกัน
+        pick = random.choice(pool)
+        self._last_random = pick
+        return pick
 
     def play_slot(self, number, from_hotkey=False):
         if number == 1:
@@ -1054,11 +1194,12 @@ class App(ctk.CTk):
         mode_group.pack(side='left')
         ctk.CTkButton(foot, text='เสร็จ', width=86, height=34, corner_radius=8, font=T.font(13, 'bold'),
                       fg_color=T.PURPLE, hover_color=T.PURPLE_DARK, text_color=T.ON_ACCENT,
-                      command=lambda: win.destroy()).pack(side='right')
+                      command=lambda: (commit(), win.destroy())).pack(side='right')
         ctk.CTkButton(foot, text='ล้างที่เลือก', width=96, height=34, corner_radius=8, font=T.font(13),
                       fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
                       command=lambda: clear_all()).pack(side='right', padx=8)
-        state = {'job': None, 'hits': []}
+        state = {'job': None, 'hits': [], 'rows': [], 'shown': {}, 'commit': None,
+                 'had_sounds': bool(slot.get('paths'))}
 
         def selected():
             return [p for p in slot.get('paths', [])]
@@ -1079,11 +1220,22 @@ class App(ctk.CTk):
                 out.append(s)
             return out
 
-        def apply(message):
+        def commit():
+            """The costly part — saving, redrawing the main list and re-registering
+            hotkeys — runs once the clicking stops, not on every click."""
+            state['commit'] = None
             self._mirror_slot(slot)
-            self._slot_cursor = {}
-            self._slots_changed(message)
-            render()
+            self.save_config()
+            self.redraw()
+            if state['had_sounds'] != bool(slot['paths']):
+                state['had_sounds'] = bool(slot['paths'])
+                self.apply_hotkeys()          # a slot with no sound holds no hotkey
+            self._prewarm_slots(300)
+
+        def later():
+            if state['commit']:
+                win.after_cancel(state['commit'])
+            state['commit'] = win.after(350, commit)
 
         def toggle(sound):
             paths = slot.setdefault('paths', [])
@@ -1091,55 +1243,84 @@ class App(ctk.CTk):
             hit = next((p for p in paths if self._key(p) == key), None)
             if hit is None:
                 paths.append(sound['path'])
-                apply(f"slot {number} + {sound['name'][:34]}  (รวม {len(paths)} เสียง)")
+                self.say(f"slot {number} + {sound['name'][:34]}  (รวม {len(paths)} เสียง)")
             else:
                 paths.remove(hit)
-                apply(f"slot {number} − {sound['name'][:34]}  (เหลือ {len(paths)} เสียง)")
+                self.say(f"slot {number} − {sound['name'][:34]}  (เหลือ {len(paths)} เสียง)")
+            self._slot_cursor = {}
+            paint()                           # just repaint the rows that are on screen
+            later()
 
         def clear_all():
             slot['paths'] = []
-            apply(f'ล้างเสียงใน slot {number} แล้ว')
+            self._slot_cursor = {}
+            self.say(f'ล้างเสียงใน slot {number} แล้ว')
+            paint()
+            later()
 
         def set_mode():
             slot['mode'] = 'order' if mode_var.get().startswith('🔁') else 'random'
-            apply(f'slot {number}: ' +
-                  ('เล่นวนตามลำดับ' if slot['mode'] == 'order' else 'สุ่มจากเสียงใน slot'))
+            self._slot_cursor = {}
+            self.say(f'slot {number}: ' +
+                     ('เล่นวนตามลำดับ' if slot['mode'] == 'order' else 'สุ่มจากเสียงใน slot'))
+            paint()
+            later()
+
+        def paint():
+            """Colours, ticks and the summary line — no widget is created here, so a
+            click stays instant even with 40 rows on screen."""
+            chosen = [self._key(p) for p in selected()]
+            order = slot.get('mode') == 'order'
+            shown = state['shown']
+            for i, (sound, row, button) in enumerate(state['rows']):
+                key = self._key(sound['path'])
+                rank = chosen.index(key) + 1 if key in chosen else 0
+                if shown.get(i) == (rank, order):
+                    continue                  # unchanged: configure() costs ~2 ms a row
+                shown[i] = (rank, order)
+                row.configure(fg_color=T.SURFACE_3 if rank else T.SURFACE_2,
+                              border_width=1 if rank else 0)
+                mark = f'{rank}. ' if rank and order else ('✓  ' if rank else '')
+                button.configure(text=mark + sound['name'])
+            count = len(chosen)
+            how = 'สุ่มมาเล่นทีละเสียง' if not order else 'เล่นวนตามลำดับ'
+            head = (f'เลือกไว้ {count} เสียง — {how}' if count > 1 else
+                    ('เลือกไว้ 1 เสียง' if count else 'ยังไม่ได้เลือกเสียง'))
+            hits = state['hits']
+            more = len(hits) - PICKER_ROWS
+            note.configure(text=f'{head}   ·   พบ {len(hits)} เสียง' +
+                           (f' (แสดง {PICKER_ROWS} แรก)' if more > 0 else '') +
+                           '   ·   ▶ = ฟังทางหูฟัง ไม่เข้าเกม')
 
         def render():
+            """Rebuild the list itself — only when the search or the filters change."""
             state['job'] = None
             for w in results.winfo_children():
                 w.destroy()
+            state['rows'] = []
+            state['shown'] = {}
             hits = matches()
             state['hits'] = hits
-            chosen = [self._key(p) for p in selected()]
             for s in hits[:PICKER_ROWS]:
-                rank = chosen.index(self._key(s['path'])) + 1 if self._key(s['path']) in chosen else 0
-                row = ctk.CTkFrame(results, fg_color=T.SURFACE_3 if rank else T.SURFACE_2,
-                                   corner_radius=9, height=44, border_width=1 if rank else 0,
-                                   border_color=T.PURPLE)
+                row = ctk.CTkFrame(results, fg_color=T.SURFACE_2, corner_radius=9, height=44,
+                                   border_width=0, border_color=T.PURPLE)
                 row.pack(fill='x', padx=6, pady=3)
                 row.pack_propagate(False)
                 ctk.CTkButton(row, text='▶', width=34, height=30, corner_radius=8, font=T.font(12),
                               fg_color='transparent', border_width=1, border_color=T.BORDER,
                               hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
                               command=lambda p=s['path']: self._preview_file(p)).pack(side='left', padx=(8, 6))
-                mark = f'{rank}. ' if rank and slot.get('mode') == 'order' else ('✓  ' if rank else '')
-                ctk.CTkButton(row, text=mark + s['name'], anchor='w', height=34,
-                              corner_radius=8, font=T.font(14), fg_color='transparent',
-                              hover_color=T.SURFACE_3, text_color=T.TEXT,
-                              command=lambda snd=s: toggle(snd)).pack(side='left', fill='x', expand=True)
+                name = ctk.CTkButton(row, text=s['name'], anchor='w', height=34,
+                                     corner_radius=8, font=T.font(14), fg_color='transparent',
+                                     hover_color=T.SURFACE_3, text_color=T.TEXT,
+                                     command=lambda snd=s: toggle(snd))
+                name.pack(side='left', fill='x', expand=True)
                 tag = [n for n in self.slots_using(s['path']) if n != number]
                 ctk.CTkLabel(row, text=(f"slot {', '.join(map(str, tag))}" if tag else self._source_of(s)),
                              width=90, font=T.font(11), text_color=T.PURPLE if tag else T.TEXT_FAINT
                              ).pack(side='right', padx=8)
-            count = len(selected())
-            how = 'สุ่มมาเล่นทีละเสียง' if slot.get('mode') != 'order' else 'เล่นวนตามลำดับ'
-            head = (f'เลือกไว้ {count} เสียง — {how}' if count > 1 else
-                    ('เลือกไว้ 1 เสียง' if count else 'ยังไม่ได้เลือกเสียง'))
-            more = len(hits) - PICKER_ROWS
-            note.configure(text=f'{head}   ·   พบ {len(hits)} เสียง' +
-                           (f' (แสดง {PICKER_ROWS} แรก)' if more > 0 else '') +
-                           '   ·   ▶ = ฟังทางหูฟัง ไม่เข้าเกม')
+                state['rows'].append((s, row, name))
+            paint()
 
         def schedule(*_):
             # รอให้พิมพ์จบก่อนค่อยวาดใหม่ พิมพ์รัว ๆ จะได้ไม่หน่วง
@@ -1149,6 +1330,7 @@ class App(ctk.CTk):
 
         watch_text(entry, schedule)
         entry.bind('<Return>', lambda e: toggle(state['hits'][0]) if state['hits'] else None)
+        win.protocol('WM_DELETE_WINDOW', lambda: (commit(), win.destroy()))
         render()
         win.after(200, entry.focus_set)
 
@@ -1266,25 +1448,19 @@ class App(ctk.CTk):
             if left > 0:
                 return self.say(f'กันสแปม: รออีก {left:.1f} วินาที', T.WARN)
             self._last_hotkey_play = time.monotonic()
-        try:
-            self.engine.play(path, gain=self._sound_volume(path))
-            self.say(f'กำลังเล่น: {os.path.basename(path)}', T.OK)
-            for row in self.rows:
-                if row.data['path'] == path:
-                    row.flash()
-        except Exception as exc:
-            self.say(f'เล่นไม่ได้: {exc}', T.DANGER)
+        self.events.play(path, self._sound_volume(path))     # starts on the playback thread
+        self.say(f'กำลังเล่น: {os.path.basename(path)}', T.OK)
+        self._flash(path)
+
+    def _flash(self, path):
+        for row in self.rows:
+            if getattr(row, 'data', None) and row.data.get('path') == path:
+                row.flash()
 
     def play_random(self, from_hotkey=False):
-        pool = [s['path'] for s in self._rows()]
-        if not pool:
-            return self.say('ยังไม่มีเสียงให้สุ่ม', T.WARN)
-        last = getattr(self, '_last_random', None)
-        if len(pool) > 1 and last in pool:
-            pool.remove(last)                # ไม่สุ่มซ้ำตัวเดิมติดกัน
-        pick = random.choice(pool)
-        self._last_random = pick
-        self.play_path(pick, from_hotkey=from_hotkey)
+        pick = self._random_path()
+        if pick:
+            self.play_path(pick, from_hotkey=from_hotkey)
 
     # ---------------------------------------------------------------- per-sound volume
     def _set_volume(self, index, value):
@@ -1329,7 +1505,7 @@ class App(ctk.CTk):
         win.protocol('WM_DELETE_WINDOW', lambda: (self.save_config(), win.destroy()))
 
     def stop_all(self):
-        self.engine.stop()
+        self.events.stop()
         self.say('หยุดเสียงแล้ว')
 
     # ---------------------------------------------------------------- hotkeys
@@ -1474,7 +1650,7 @@ class App(ctk.CTk):
             self.say(f'ฮอตคีย์พร้อมใช้งาน ({len(entries)} ปุ่ม)', T.OK)
 
     def _fire(self, path):
-        self.events.put(('play', path))
+        self.events.put(('play', path))      # -> _dispatch_audio, on this very thread
 
     def _fire_slot(self, number):
         self.events.put(('slot', number))
@@ -1489,14 +1665,11 @@ class App(ctk.CTk):
         try:
             while True:
                 evt = self.events.get_nowait()
-                if evt[0] == 'play':
-                    self.play_path(evt[1], from_hotkey=True)
-                elif evt[0] == 'slot':
-                    self.play_slot(evt[1], from_hotkey=True)
-                elif evt[0] == 'random':
-                    self.play_random(from_hotkey=True)
-                elif evt[0] == 'stop':
-                    self.stop_all()
+                if evt[0] == 'played':          # the sound is already playing
+                    self.say(f'กำลังเล่น: {os.path.basename(evt[1])}', T.OK)
+                    self._flash(evt[1])
+                elif evt[0] == 'note':
+                    self.say(evt[1], evt[2])
                 elif evt[0] == 'mute':          # from the phone remote
                     self.sw_mute.var.set(evt[1])
                     self.apply_mic_mute()
@@ -2807,6 +2980,8 @@ class App(ctk.CTk):
                state='normal' if autostart.supported() else 'disabled', default=False)
 
         section('หน่วยความจำ')
+        switch('อุ่นเสียงใน slot ไว้ล่วงหน้า  (กดครั้งแรกไม่ต้องรอถอดไฟล์ · แรม +~10 MB)', 'prewarm',
+               lambda on: self._prewarm_slots(100) if on else None)
         mem = ctk.CTkLabel(body, text='', font=T.font(13), text_color=T.TEXT_DIM)
         mem.pack(anchor='w', padx=18, pady=(4, 0))
 
