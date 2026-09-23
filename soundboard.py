@@ -282,14 +282,28 @@ class SlotRow(ctk.CTkFrame):
             ctk.CTkLabel(self, text=f'สุ่มจากคลังเสียงทั้งหมด ({n} เสียง)', anchor='w',
                          font=T.font(15), text_color=T.TEXT).pack(side='left', fill='x', expand=True)
         else:
-            sound = app.sound_by_path(slot.get('path'))
+            sounds = app.slot_sounds(slot)
+            order = slot.get('mode') == 'order'
+            if not sounds:
+                text, color = '—  กดเพื่อเลือกเสียง  —', T.TEXT_FAINT
+            elif len(sounds) == 1:
+                text, color = sounds[0]['name'], T.TEXT
+            else:
+                names = ', '.join(s['name'] for s in sounds)
+                text = f'{len(sounds)} เสียง · {names}'
+                text = text if len(text) <= 58 else text[:57] + '…'
+                color = T.TEXT
             self.pick = ctk.CTkButton(
-                self, text=(sound['name'] if sound else '—  กดเพื่อเลือกเสียง  —'), anchor='w',
-                height=36, corner_radius=8, font=T.font(15),
-                fg_color='transparent', hover_color=T.SURFACE_3,
-                text_color=T.TEXT if sound else T.TEXT_FAINT,
+                self, text=text, anchor='w', height=36, corner_radius=8, font=T.font(15),
+                fg_color='transparent', hover_color=T.SURFACE_3, text_color=color,
                 command=lambda: app.pick_sound(number))
             self.pick.pack(side='left', fill='x', expand=True)
+            if len(sounds) > 1:
+                # 🎲 random / 🔁 in order — click to switch
+                ctk.CTkButton(
+                    self, text='🔁' if order else '🎲', width=36, height=32, corner_radius=8,
+                    font=T.font(14), fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                    command=lambda: app.toggle_slot_mode(number)).pack(side='left', padx=(4, 0))
 
         ctk.CTkButton(self, text='✕', width=34, height=34, corner_radius=8, font=T.font(14),
                       fg_color='transparent', hover_color=T.DANGER, text_color=T.TEXT_FAINT,
@@ -804,9 +818,8 @@ class App(ctk.CTk):
                 row.pack(fill='x', padx=10, pady=4)
                 self.rows.append(row)
             for n, slot in enumerate(self.config_data['slots'], start=2):
-                sound = self.sound_by_path(slot.get('path'))
-                if needle and needle not in (sound['name'].lower() if sound else '') \
-                        and needle != (slot.get('hotkey') or '').lower():
+                names = ' '.join(s['name'] for s in self.slot_sounds(slot)).lower()
+                if needle and needle not in names and needle != (slot.get('hotkey') or '').lower():
                     continue
                 row = SlotRow(self.list, self, n, slot)
                 row.pack(fill='x', padx=10, pady=4)
@@ -843,7 +856,17 @@ class App(ctk.CTk):
     def slots_using(self, path):
         key = self._key(path)
         return [n for n, s in enumerate(self.config_data['slots'], start=2)
-                if s.get('path') and self._key(s['path']) == key]
+                if any(self._key(p) == key for p in s.get('paths', []))]
+
+    @staticmethod
+    def _mirror_slot(slot):
+        """Keep 'path' as the first sound, so a v1.9-or-older build reading this
+        config still finds something in every slot."""
+        slot['path'] = slot['paths'][0] if slot.get('paths') else ''
+
+    def slot_sounds(self, slot):
+        """The slot's sounds that still exist, in order."""
+        return [s for s in (self.sound_by_path(p) for p in slot.get('paths', [])) if s]
 
     def _slot(self, number):
         """number 2.. -> the slot dict (slot 1 is the random slot and has none)"""
@@ -868,20 +891,50 @@ class App(ctk.CTk):
     def add_to_slot(self, path):
         """From the library: drop the sound into the first empty slot, making one if needed."""
         slots = self.config_data['slots']
-        free = next((i for i, s in enumerate(slots) if not s.get('path')), None)
+        free = next((i for i, s in enumerate(slots) if not s.get('paths')), None)
         if free is None:
-            slots.append({'hotkey': '', 'path': ''})
+            slots.append({'hotkey': '', 'paths': [], 'mode': 'random'})
             free = len(slots) - 1
-        slots[free]['path'] = path
+        slots[free].setdefault('paths', []).append(path)
+        self._mirror_slot(slots[free])
         self._slots_changed(f'ใส่ลง slot {free + 2} แล้ว — ไปตั้งปุ่มได้ที่แท็บ "ช่องคีย์ลัด"')
 
-    def play_slot(self, number):
+    def toggle_slot_mode(self, number):
+        slot = self._slot(number)
+        slot['mode'] = 'random' if slot.get('mode') == 'order' else 'order'
+        self._slot_cursor = {}
+        self._slots_changed(f'slot {number}: ' +
+                            ('เล่นวนตามลำดับ' if slot['mode'] == 'order' else 'สุ่มจากเสียงใน slot'))
+
+    def play_slot(self, number, from_hotkey=False):
         if number == 1:
-            return self.play_random()
-        sound = self.sound_by_path(self._slot(number).get('path'))
-        if sound is None:
+            return self.play_random(from_hotkey)
+        slot = self._slot(number)
+        sounds = self.slot_sounds(slot)
+        if not sounds:
+            if from_hotkey:
+                return self.say(f'slot {number} ยังไม่ได้ใส่เสียง', T.WARN)
             return self.pick_sound(number)
-        self.play_path(sound['path'])
+        self.play_path(self._pick_from_slot(number, slot, sounds), from_hotkey=from_hotkey)
+
+    def _pick_from_slot(self, number, slot, sounds):
+        """Several sounds in one slot: random — never the same one twice in a row —
+        or in order, one per press."""
+        paths = [s['path'] for s in sounds]
+        if len(paths) == 1:
+            return paths[0]
+        cursor = getattr(self, '_slot_cursor', None)
+        if cursor is None:
+            cursor = self._slot_cursor = {}
+        if slot.get('mode') == 'order':
+            index = (cursor.get(number, -1) + 1) % len(paths)
+            cursor[number] = index
+            return paths[index]
+        last = cursor.get(('last', number))
+        pool = [p for p in paths if p != last] or paths
+        pick = random.choice(pool)
+        cursor[('last', number)] = pick
+        return pick
 
     def _hotkey_owner(self, spec):
         if spec and self.config_data.get('random_hotkey') == spec:
@@ -920,17 +973,27 @@ class App(ctk.CTk):
         if not self.config_data.get('slots'):
             keyed = [s for s in sounds if s.get('hotkey')]
             natural = lambda s: [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', s['hotkey'])]
-            self.config_data['slots'] = [{'hotkey': s['hotkey'], 'path': s['path']}
+            self.config_data['slots'] = [{'hotkey': s['hotkey'], 'paths': [s['path']]}
                                          for s in sorted(keyed, key=natural)]
             while len(self.config_data['slots']) < DEFAULT_SLOTS:
-                self.config_data['slots'].append({'hotkey': '', 'path': ''})
+                self.config_data['slots'].append({'hotkey': '', 'paths': []})
         for s in sounds:
             s.pop('hotkey', None)
         for slot in self.config_data['slots']:
             slot.setdefault('hotkey', '')
-            slot.setdefault('path', '')
-            if slot['path'] and self.sound_by_path(slot['path']) is None:
-                slot['path'] = ''                # ไฟล์หายไปแล้ว เก็บปุ่มไว้ ล้างแค่เสียง
+            # up to v1.9 a slot held one sound in 'path'; now it holds a list in 'paths'
+            paths = slot.get('paths')
+            if not isinstance(paths, list):
+                paths = [slot['path']] if slot.get('path') else []
+            seen, keep = set(), []
+            for p in paths:
+                key = self._key(p) if p else ''
+                if key and key not in seen and self.sound_by_path(p) is not None:
+                    seen.add(key)                # ไฟล์หายไปแล้ว เก็บปุ่มไว้ ล้างแค่เสียง
+                    keep.append(p)
+            slot['paths'] = keep
+            slot['mode'] = 'order' if slot.get('mode') == 'order' else 'random'
+            self._mirror_slot(slot)
 
     # ---------------------------------------------------------------- sound picker
     @staticmethod
@@ -947,13 +1010,16 @@ class App(ctk.CTk):
         return 'ของฉัน'
 
     def pick_sound(self, number):
+        """Pick one sound — or several: a slot plays a random one of them each press."""
         slot = self._slot(number)
-        win = self._dialog(f'เลือกเสียงให้ slot {number}', 700, 640, modal=False)
+        win = self._dialog(f'เลือกเสียงให้ slot {number}', 700, 700, modal=False)
         ctk.CTkLabel(win, text=f'เลือกเสียงให้ slot {number}' +
                      (f"  ·  {slot['hotkey']}" if slot.get('hotkey') else ''),
-                     font=T.font(17, 'bold'), text_color=T.TEXT).pack(pady=(18, 10))
+                     font=T.font(17, 'bold'), text_color=T.TEXT).pack(pady=(18, 2))
+        ctk.CTkLabel(win, text='กดชื่อเสียงเพื่อเลือก · เลือกได้หลายเสียง แล้วเวลากดปุ่มลัดจะสุ่มมาเล่นทีละเสียง',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(pady=(0, 10))
 
-        entry = ctk.CTkEntry(win, placeholder_text='พิมพ์ชื่อเสียง… (Enter = เลือกอันแรก)', height=40,
+        entry = ctk.CTkEntry(win, placeholder_text='พิมพ์ชื่อเสียง… (Enter = เลือก/เอาออก อันแรก)', height=40,
                              corner_radius=9, font=T.font(14), fg_color=T.INPUT,
                              border_color=T.BORDER, text_color=T.TEXT)
         entry.pack(fill='x', padx=20)
@@ -976,28 +1042,68 @@ class App(ctk.CTk):
                                          border_width=1, border_color=T.BORDER)
         results.pack(fill='both', expand=True, padx=20, pady=(4, 8))
         note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT)
-        note.pack(pady=(0, 12))
+        note.pack(pady=(0, 4))
+
+        foot = ctk.CTkFrame(win, fg_color='transparent')
+        foot.pack(fill='x', padx=20, pady=(0, 14))
+        mode_var = ctk.StringVar(value='🔁  เรียงตามลำดับ' if slot.get('mode') == 'order' else '🎲  สุ่ม')
+        mode_group = ToggleGroup(foot, ['🎲  สุ่ม', '🔁  เรียงตามลำดับ'], mode_var,
+                                 command=lambda _v: set_mode())
+        for b in mode_group.buttons.values():
+            b.configure(width=132, height=32)
+        mode_group.pack(side='left')
+        ctk.CTkButton(foot, text='เสร็จ', width=86, height=34, corner_radius=8, font=T.font(13, 'bold'),
+                      fg_color=T.PURPLE, hover_color=T.PURPLE_DARK, text_color=T.ON_ACCENT,
+                      command=lambda: win.destroy()).pack(side='right')
+        ctk.CTkButton(foot, text='ล้างที่เลือก', width=96, height=34, corner_radius=8, font=T.font(13),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: clear_all()).pack(side='right', padx=8)
         state = {'job': None, 'hits': []}
+
+        def selected():
+            return [p for p in slot.get('paths', [])]
 
         def matches():
             needle = entry.get().strip().lower()
             want = src_var.get()
-            used = {self._key(s['path']) for s in self.config_data['slots'] if s.get('path')}
+            used = {self._key(p) for s in self.config_data['slots'] for p in s.get('paths', [])}
+            mine = {self._key(p) for p in selected()}
             out = []
             for s in self._rows():
                 if needle and needle not in s['name'].lower():
                     continue
                 if want != 'ทั้งหมด' and self._source_of(s) != want:
                     continue
-                if free_var.get() and self._key(s['path']) in used:
+                if free_var.get() and self._key(s['path']) in used - mine:
                     continue
                 out.append(s)
             return out
 
-        def choose(sound):
-            slot['path'] = sound['path']
-            win.destroy()
-            self._slots_changed(f"slot {number} = {sound['name'][:40]}")
+        def apply(message):
+            self._mirror_slot(slot)
+            self._slot_cursor = {}
+            self._slots_changed(message)
+            render()
+
+        def toggle(sound):
+            paths = slot.setdefault('paths', [])
+            key = self._key(sound['path'])
+            hit = next((p for p in paths if self._key(p) == key), None)
+            if hit is None:
+                paths.append(sound['path'])
+                apply(f"slot {number} + {sound['name'][:34]}  (รวม {len(paths)} เสียง)")
+            else:
+                paths.remove(hit)
+                apply(f"slot {number} − {sound['name'][:34]}  (เหลือ {len(paths)} เสียง)")
+
+        def clear_all():
+            slot['paths'] = []
+            apply(f'ล้างเสียงใน slot {number} แล้ว')
+
+        def set_mode():
+            slot['mode'] = 'order' if mode_var.get().startswith('🔁') else 'random'
+            apply(f'slot {number}: ' +
+                  ('เล่นวนตามลำดับ' if slot['mode'] == 'order' else 'สุ่มจากเสียงใน slot'))
 
         def render():
             state['job'] = None
@@ -1005,29 +1111,35 @@ class App(ctk.CTk):
                 w.destroy()
             hits = matches()
             state['hits'] = hits
-            current = self._key(slot['path']) if slot.get('path') else None
+            chosen = [self._key(p) for p in selected()]
             for s in hits[:PICKER_ROWS]:
-                mine = current == self._key(s['path'])
-                row = ctk.CTkFrame(results, fg_color=T.SURFACE_3 if mine else T.SURFACE_2,
-                                   corner_radius=9, height=44)
+                rank = chosen.index(self._key(s['path'])) + 1 if self._key(s['path']) in chosen else 0
+                row = ctk.CTkFrame(results, fg_color=T.SURFACE_3 if rank else T.SURFACE_2,
+                                   corner_radius=9, height=44, border_width=1 if rank else 0,
+                                   border_color=T.PURPLE)
                 row.pack(fill='x', padx=6, pady=3)
                 row.pack_propagate(False)
                 ctk.CTkButton(row, text='▶', width=34, height=30, corner_radius=8, font=T.font(12),
                               fg_color='transparent', border_width=1, border_color=T.BORDER,
                               hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
                               command=lambda p=s['path']: self._preview_file(p)).pack(side='left', padx=(8, 6))
-                ctk.CTkButton(row, text=('✓  ' if mine else '') + s['name'], anchor='w', height=34,
+                mark = f'{rank}. ' if rank and slot.get('mode') == 'order' else ('✓  ' if rank else '')
+                ctk.CTkButton(row, text=mark + s['name'], anchor='w', height=34,
                               corner_radius=8, font=T.font(14), fg_color='transparent',
                               hover_color=T.SURFACE_3, text_color=T.TEXT,
-                              command=lambda snd=s: choose(snd)).pack(side='left', fill='x', expand=True)
-                tag = self.slots_using(s['path'])
+                              command=lambda snd=s: toggle(snd)).pack(side='left', fill='x', expand=True)
+                tag = [n for n in self.slots_using(s['path']) if n != number]
                 ctk.CTkLabel(row, text=(f"slot {', '.join(map(str, tag))}" if tag else self._source_of(s)),
                              width=90, font=T.font(11), text_color=T.PURPLE if tag else T.TEXT_FAINT
                              ).pack(side='right', padx=8)
+            count = len(selected())
+            how = 'สุ่มมาเล่นทีละเสียง' if slot.get('mode') != 'order' else 'เล่นวนตามลำดับ'
+            head = (f'เลือกไว้ {count} เสียง — {how}' if count > 1 else
+                    ('เลือกไว้ 1 เสียง' if count else 'ยังไม่ได้เลือกเสียง'))
             more = len(hits) - PICKER_ROWS
-            note.configure(text=(f'พบ {len(hits)} เสียง' + (f' — แสดง {PICKER_ROWS} แรก พิมพ์เพิ่มเพื่อกรอง'
-                                                            if more > 0 else '') + '   ·   ▶ = ฟังทางหูฟัง ไม่เข้าเกม')
-                           if hits else 'ไม่พบเสียงที่ตรงกับตัวกรอง')
+            note.configure(text=f'{head}   ·   พบ {len(hits)} เสียง' +
+                           (f' (แสดง {PICKER_ROWS} แรก)' if more > 0 else '') +
+                           '   ·   ▶ = ฟังทางหูฟัง ไม่เข้าเกม')
 
         def schedule(*_):
             # รอให้พิมพ์จบก่อนค่อยวาดใหม่ พิมพ์รัว ๆ จะได้ไม่หน่วง
@@ -1036,7 +1148,7 @@ class App(ctk.CTk):
             state['job'] = win.after(180, render)
 
         watch_text(entry, schedule)
-        entry.bind('<Return>', lambda e: choose(state['hits'][0]) if state['hits'] else None)
+        entry.bind('<Return>', lambda e: toggle(state['hits'][0]) if state['hits'] else None)
         render()
         win.after(200, entry.focus_set)
 
@@ -1105,8 +1217,8 @@ class App(ctk.CTk):
             name = self._rows()[index]['name']
             gone = self._key(self._rows()[index]['path'])
             for slot in self.config_data['slots']:
-                if slot.get('path') and self._key(slot['path']) == gone:
-                    slot['path'] = ''
+                slot['paths'] = [p for p in slot.get('paths', []) if self._key(p) != gone]
+                self._mirror_slot(slot)
             del self._rows()[index]
             self.redraw()
             self.apply_hotkeys()
@@ -1334,10 +1446,9 @@ class App(ctk.CTk):
 
         entries, specs, bad = [], [], []
         wanted = []
-        for slot in self.config_data['slots']:
-            sound = self.sound_by_path(slot.get('path'))
-            if slot.get('hotkey') and sound is not None:
-                wanted.append((slot['hotkey'], partial(self._fire, sound['path'])))
+        for number, slot in enumerate(self.config_data['slots'], start=2):
+            if slot.get('hotkey') and self.slot_sounds(slot):
+                wanted.append((slot['hotkey'], partial(self._fire_slot, number)))
         wanted.append((self.config_data.get('stop_hotkey'), self._fire_stop))
         wanted.append((self.config_data.get('random_hotkey'), self._fire_random))
         for spec, callback in wanted:
@@ -1365,6 +1476,9 @@ class App(ctk.CTk):
     def _fire(self, path):
         self.events.put(('play', path))
 
+    def _fire_slot(self, number):
+        self.events.put(('slot', number))
+
     def _fire_stop(self):
         self.events.put(('stop',))
 
@@ -1377,6 +1491,8 @@ class App(ctk.CTk):
                 evt = self.events.get_nowait()
                 if evt[0] == 'play':
                     self.play_path(evt[1], from_hotkey=True)
+                elif evt[0] == 'slot':
+                    self.play_slot(evt[1], from_hotkey=True)
                 elif evt[0] == 'random':
                     self.play_random(from_hotkey=True)
                 elif evt[0] == 'stop':
@@ -1422,10 +1538,13 @@ class App(ctk.CTk):
         by_key = {self._key(p): i for i, p in ids.items()}
         slots = [{'n': 1, 'random': True, 'hotkey': self.config_data.get('random_hotkey', '')}]
         for n, slot in enumerate(self.config_data['slots'], start=2):
-            sound = self.sound_by_path(slot.get('path'))
-            slots.append({'n': n, 'hotkey': slot.get('hotkey', ''),
-                          'id': by_key.get(self._key(sound['path'])) if sound else None,
-                          'name': label(sound['name']) if sound else ''})
+            in_slot = self.slot_sounds(slot)          # not `sounds` — that is the library above
+            first = label(in_slot[0]['name']) if in_slot else ''
+            slots.append({'n': n, 'hotkey': slot.get('hotkey', ''), 'count': len(in_slot),
+                          'mode': slot.get('mode', 'random'),
+                          'id': by_key.get(self._key(in_slot[0]['path'])) if in_slot else None,
+                          'name': first if len(in_slot) < 2 else
+                                  f'{len(in_slot)} เสียง · {first}'})
         mic = self.engine.mic
         self._remote_snap = {
             'slots': slots, 'sounds': sounds, 'paths': ids,

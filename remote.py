@@ -144,6 +144,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {'ok': False, 'msg': f'กันสแปม: รออีก {wait:.1f} วิ'})
             events.put(('play', path))
             return self._json(200, {'ok': True})
+        if url.path == '/api/slot':
+            try:
+                number = int(body.get('n'))
+            except (TypeError, ValueError):
+                return self._json(400, {'ok': False})
+            if not any(s['n'] == number for s in snap.get('slots', [])):
+                return self._json(404, {'ok': False, 'msg': 'ไม่พบ slot นี้แล้ว'})
+            wait = self.remote.cooldown_left()
+            if wait > 0:
+                return self._json(200, {'ok': False, 'msg': f'กันสแปม: รออีก {wait:.1f} วิ'})
+            events.put(('random',) if number == 1 else ('slot', number))
+            return self._json(200, {'ok': True})
         if url.path == '/api/random':
             events.put(('random',))
             return self._json(200, {'ok': True})
@@ -240,9 +252,9 @@ function render(){
   const g = $('grid'); let html = '';
   if(view === 'slots'){
     for(const s of S.slots){
-      if(s.random) html += `<button class="pad rand" data-rand="1"><span class="n">SLOT ${s.n} · 🎲</span><span class="t">สุ่มเสียง</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
-      else if(!s.id) html += `<button class="pad empty" disabled><span class="n">SLOT ${s.n}</span><span class="t">ยังไม่ได้ใส่เสียง</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
-      else html += `<button class="pad" data-id="${s.id}"><span class="n">SLOT ${s.n}</span><span class="t">${esc(s.name)}</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
+      if(s.random) html += `<button class="pad rand" data-slot="${s.n}"><span class="n">SLOT ${s.n} · 🎲</span><span class="t">สุ่มเสียง</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
+      else if(!s.count) html += `<button class="pad empty" disabled><span class="n">SLOT ${s.n}</span><span class="t">ยังไม่ได้ใส่เสียง</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
+      else html += `<button class="pad" data-slot="${s.n}"><span class="n">SLOT ${s.n}${s.count > 1 ? ' · ' + (s.mode === 'order' ? '🔁' : '🎲') + ' ' + s.count : ''}</span><span class="t">${esc(s.name)}</span><span class="k">${esc(s.hotkey||'')}</span></button>`;
     }
     if(!S.slots.length) html = '<div class="empty-msg">ยังไม่มี slot — ตั้งในโปรแกรมก่อน</div>';
   } else {
@@ -261,7 +273,7 @@ $('grid').addEventListener('click', async e => {
   const b = e.target.closest('.pad'); if(!b || b.disabled) return;
   navigator.vibrate && navigator.vibrate(18);
   b.classList.add('hit'); setTimeout(()=>b.classList.remove('hit'), 250);
-  const j = b.dataset.rand ? await api('/api/random', {}) : await api('/api/play', {id: b.dataset.id});
+  const j = b.dataset.slot ? await api('/api/slot', {n: +b.dataset.slot}) : await api('/api/play', {id: b.dataset.id});
   if(j && !j.ok && j.msg) toast(j.msg);
 });
 $('stop').onclick = async () => { navigator.vibrate && navigator.vibrate(30); await api('/api/stop', {}); toast('หยุดเสียงแล้ว'); };
