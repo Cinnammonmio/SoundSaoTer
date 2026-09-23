@@ -95,6 +95,49 @@ COLORS = {
             PURPLE='#BE185D', PURPLE_DARK='#9D174D', PINK='#0E7490', PINK_DARK='#155E75',
             BLUE='#B45309', BLUE_DARK='#92400E',
             TEXT='#240A30', TEXT_DIM='#4C2C5C', TEXT_FAINT='#6B4B7B', **LIGHT_STATUS)),
+    # โทนสว่างนุ่ม ๆ แนว neumorphism / พาสเทล / glassmorphism (เพิ่มใน 1.12.0)
+    'นุ่มละมุน': dict(
+        dark=dict(
+            BG='#1B1E27', SURFACE='#232733', SURFACE_2='#2A2F3D', SURFACE_3='#343A4B',
+            INPUT='#262B37', BORDER='#3A4052',
+            PURPLE='#8B82F0', PURPLE_DARK='#7870CE', PINK='#C08AE8', PINK_DARK='#A577C8',
+            BLUE='#7E97EC', BLUE_DARK='#6C82CB',
+            TEXT='#E8EBF5', TEXT_DIM='#AEB6CA', TEXT_FAINT='#8B93A8',
+            OK='#4ADE80', WARN='#FBBF24', DANGER='#F87171'),
+        light=dict(
+            BG='#E6E9F2', SURFACE='#EFF2F8', SURFACE_2='#E7EBF4', SURFACE_3='#DADFEC',
+            INPUT='#EAEEF6', BORDER='#D2D8E7',
+            PURPLE='#6357D8', PURPLE_DARK='#5349B5', PINK='#9A56C4', PINK_DARK='#8148A5',
+            BLUE='#4D6CD0', BLUE_DARK='#415BAF',
+            TEXT='#262B3B', TEXT_DIM='#525A70', TEXT_FAINT='#5F6679', **LIGHT_STATUS)),
+    'พาสเทลหวาน': dict(
+        dark=dict(
+            BG='#241E2B', SURFACE='#2E2736', SURFACE_2='#372F42', SURFACE_3='#443A51',
+            INPUT='#322A3B', BORDER='#4A4056',
+            PURPLE='#B49BF0', PURPLE_DARK='#9B85CE', PINK='#F09CC0', PINK_DARK='#CE86A5',
+            BLUE='#8EC0EC', BLUE_DARK='#7AA5CB',
+            TEXT='#F3EAF8', TEXT_DIM='#C4B4D0', TEXT_FAINT='#A192AE',
+            OK='#6EE7B7', WARN='#FCD34D', DANGER='#FCA5A5'),
+        light=dict(
+            BG='#FAF5F0', SURFACE='#FFFFFF', SURFACE_2='#F7F2FB', SURFACE_3='#EDE4F6',
+            INPUT='#F6F1FA', BORDER='#E5DCEF',
+            PURPLE='#7E62CE', PURPLE_DARK='#6A52AD', PINK='#B6547F', PINK_DARK='#99476B',
+            BLUE='#4577AA', BLUE_DARK='#3A648F',
+            TEXT='#3A2F45', TEXT_DIM='#655774', TEXT_FAINT='#746880', **LIGHT_STATUS)),
+    'กระจกใส': dict(
+        dark=dict(
+            BG='#131A24', SURFACE='#1B2430', SURFACE_2='#212C3A', SURFACE_3='#2B3849',
+            INPUT='#1E2835', BORDER='#334255',
+            PURPLE='#7D8FF0', PURPLE_DARK='#6C7BCE', PINK='#5FC9C2', PINK_DARK='#52ADA7',
+            BLUE='#6FA3E8', BLUE_DARK='#5F8CC8',
+            TEXT='#E6EEF8', TEXT_DIM='#A9B8CB', TEXT_FAINT='#8796AA',
+            OK='#4ADE80', WARN='#FBBF24', DANGER='#F87171'),
+        light=dict(
+            BG='#E9EFFA', SURFACE='#F7FAFE', SURFACE_2='#EDF3FC', SURFACE_3='#DCE7F6',
+            INPUT='#F1F6FD', BORDER='#CBDAEE',
+            PURPLE='#4B5FD0', PURPLE_DARK='#3F50AF', PINK='#297F7A', PINK_DARK='#226B66',
+            BLUE='#3C76BE', BLUE_DARK='#3263A0',
+            TEXT='#1B2736', TEXT_DIM='#465A70', TEXT_FAINT='#5E6B7D', **LIGHT_STATUS)),
 }
 DEFAULT = 'ม่วงนีออน'
 NAMES = list(COLORS)

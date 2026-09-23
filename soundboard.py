@@ -3217,7 +3217,7 @@ class App(ctk.CTk):
         self.engine.cache.budget = int(self.config_data.get('cache_mb', 40)) * 1024 * 1024
 
     def open_settings(self):
-        win = self._dialog('ตั้งค่า', 580, 860, modal=False)
+        win = self._dialog('ตั้งค่า', 580, 940, modal=False)
         ctk.CTkLabel(win, text='ตั้งค่า', font=T.font(19, 'bold'), text_color=T.TEXT).pack(pady=(18, 8))
         body = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12,
                             border_width=1, border_color=T.BORDER)
