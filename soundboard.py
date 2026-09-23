@@ -81,6 +81,7 @@ def default_config():
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
         'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
+        'share_repo': '',
     }
 
 
@@ -659,6 +660,7 @@ class App(ctk.CTk):
             ('+  เพิ่มทั้งโฟลเดอร์', self.add_folder, T.INPUT, T.SURFACE_3),
             ('⭳  โหลดเสียงจากเว็บ', self.open_downloader, T.PINK, T.PINK_DARK),
             ('✂  ตัดจาก YouTube', self.open_yt_clipper, T.BLUE, T.BLUE_DARK),
+            ('🤝  แชร์เสียง', self.open_share, T.INPUT, T.SURFACE_3),
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
@@ -1684,6 +1686,331 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(80, self._tick)
+
+    # ---------------------------------------------------------------- share sounds
+    def open_share(self):
+        existing = getattr(self, '_share_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import soundshare as sh
+        cfg = self.config_data
+        win = self._dialog('แชร์เสียงกับเพื่อน', 680, 760, modal=False)
+        self._share_win = win
+        state = {'shelf': None, 'index': [], 'friend': None, 'busy': False}
+
+        ctk.CTkLabel(win, text='🤝  แชร์เสียงกับเพื่อน', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(18, 0))
+        ctk.CTkLabel(win, text='เก็บเสียงไว้ใน repo ส่วนตัวของคุณบน GitHub (ไม่เปิดสาธารณะ) แล้วส่งรหัสให้เพื่อนโหลด',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(anchor='w', padx=24, pady=(2, 10))
+
+        side = ctk.StringVar(value='⬆  เสียงของฉัน')
+        ToggleGroup(win, ['⬆  เสียงของฉัน', '⬇  เสียงของเพื่อน'], side,
+                    command=lambda _v: show_side()).pack(anchor='w', padx=22)
+
+        mine = ctk.CTkFrame(win, fg_color='transparent')
+        theirs = ctk.CTkFrame(win, fg_color='transparent')
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
+                            anchor='w', wraplength=610)
+        note.pack(side='bottom', fill='x', padx=24, pady=(6, 14))
+        bar = ctk.CTkProgressBar(win, height=8, corner_radius=4, fg_color=T.INPUT, progress_color=T.PINK)
+
+        def set_note(text, tone=None):
+            if win.winfo_exists():
+                note.configure(text=text, text_color=tone or T.TEXT_FAINT)
+
+        def progress(done, total):
+            def paint():
+                if not win.winfo_exists():
+                    return
+                if total and done < total:
+                    bar.pack(fill='x', padx=24, pady=(0, 4), before=note)
+                    bar.set(done / total)
+                else:
+                    bar.pack_forget()
+            self.after(0, paint)
+
+        def run_bg(work, done=None, busy_text=''):
+            """GitHub calls happen off the UI thread; results come back through after()."""
+            if state['busy']:
+                return set_note('รออันที่กำลังทำอยู่ให้เสร็จก่อน', T.WARN)
+            state['busy'] = True
+            if busy_text:
+                set_note(busy_text, T.WARN)
+
+            def worker():
+                try:
+                    out = work()
+                    self.after(0, lambda: finish(out, None))
+                except Exception as exc:
+                    self.after(0, lambda: finish(None, exc))
+
+            def finish(out, exc):
+                state['busy'] = False
+                bar.pack_forget()
+                if exc is not None:
+                    return set_note(sh.friendly_error(exc), T.DANGER)
+                if done:
+                    done(out)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # ============================================================ my sounds
+        top = ctk.CTkFrame(mine, fg_color=T.SURFACE, corner_radius=12, border_width=1, border_color=T.BORDER)
+        top.pack(fill='x', pady=(10, 8))
+        row1 = ctk.CTkFrame(top, fg_color='transparent')
+        row1.pack(fill='x', padx=14, pady=(12, 6))
+        ctk.CTkLabel(row1, text='GitHub token', width=94, anchor='w', font=T.font(12),
+                     text_color=T.TEXT_DIM).pack(side='left')
+        token_ent = ctk.CTkEntry(row1, height=32, corner_radius=8, font=T.font(12), show='•',
+                                 fg_color=T.INPUT, border_color=T.BORDER, text_color=T.TEXT,
+                                 placeholder_text='วาง token ที่สร้างจาก GitHub')
+        token_ent.pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(row1, text='วิธีสร้าง', width=76, height=32, corner_radius=8, font=T.font(12),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: how_token()).pack(side='left', padx=(6, 0))
+        ctk.CTkButton(row1, text='เชื่อมต่อ', width=82, height=32, corner_radius=8, font=T.font(12, 'bold'),
+                      fg_color=T.PURPLE, hover_color=T.PURPLE_DARK, text_color=T.ON_ACCENT,
+                      command=lambda: connect()).pack(side='left', padx=(6, 0))
+        who = ctk.CTkLabel(top, text='', font=T.font(12), text_color=T.TEXT_DIM, anchor='w')
+        who.pack(fill='x', padx=14, pady=(0, 6))
+        row2 = ctk.CTkFrame(top, fg_color='transparent')
+        row2.pack(fill='x', padx=14, pady=(0, 12))
+        ctk.CTkLabel(row2, text='รหัสให้เพื่อน', width=94, anchor='w', font=T.font(12),
+                     text_color=T.TEXT_DIM).pack(side='left')
+        code_ent = ctk.CTkEntry(row2, height=32, corner_radius=8, font=T.font(12), fg_color=T.INPUT,
+                                border_color=T.BORDER, text_color=T.TEXT_DIM)
+        code_ent.pack(side='left', fill='x', expand=True)
+        copy_btn = ctk.CTkButton(row2, text='คัดลอก', width=76, height=32, corner_radius=8, font=T.font(12),
+                                 fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                                 state='disabled', command=lambda: copy_code())
+        copy_btn.pack(side='left', padx=(6, 0))
+
+        head = ctk.CTkFrame(mine, fg_color='transparent')
+        head.pack(fill='x', pady=(2, 4))
+        ctk.CTkLabel(head, text='เสียงในคลังของคุณ', font=T.font(13, 'bold'),
+                     text_color=T.TEXT).pack(side='left')
+        up_all = ctk.CTkButton(head, text='⬆  อัปที่ยังไม่ได้อัป', width=150, height=30, corner_radius=8,
+                               font=T.font(12), fg_color=T.INPUT, hover_color=T.SURFACE_3,
+                               text_color=T.TEXT, state='disabled', command=lambda: upload_rest())
+        up_all.pack(side='right')
+        my_list = ctk.CTkScrollableFrame(mine, fg_color=T.SURFACE, corner_radius=12,
+                                         border_width=1, border_color=T.BORDER, height=250)
+        my_list.pack(fill='both', expand=True)
+
+        # ============================================================ their sounds
+        get_row = ctk.CTkFrame(theirs, fg_color='transparent')
+        get_row.pack(fill='x', pady=(12, 8))
+        friend_ent = ctk.CTkEntry(get_row, height=36, corner_radius=8, font=T.font(12), fg_color=T.INPUT,
+                                  border_color=T.BORDER, text_color=T.TEXT,
+                                  placeholder_text='วางรหัสชุดเสียงที่เพื่อนส่งมา (ขึ้นต้น SST1-)')
+        friend_ent.pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(get_row, text='ดูรายการเสียง', width=120, height=36, corner_radius=8,
+                      font=T.font(12, 'bold'), fg_color=T.PINK, hover_color=T.PINK_DARK,
+                      text_color=T.ON_ACCENT, command=lambda: open_friend()).pack(side='left', padx=(8, 0))
+        head2 = ctk.CTkFrame(theirs, fg_color='transparent')
+        head2.pack(fill='x', pady=(2, 4))
+        friend_who = ctk.CTkLabel(head2, text='', font=T.font(13, 'bold'), text_color=T.TEXT, anchor='w')
+        friend_who.pack(side='left')
+        down_all = ctk.CTkButton(head2, text='⬇  โหลดที่ยังไม่มีทั้งหมด', width=180, height=30,
+                                 corner_radius=8, font=T.font(12), fg_color=T.INPUT,
+                                 hover_color=T.SURFACE_3, text_color=T.TEXT, state='disabled',
+                                 command=lambda: download_rest())
+        down_all.pack(side='right')
+        their_list = ctk.CTkScrollableFrame(theirs, fg_color=T.SURFACE, corner_radius=12,
+                                            border_width=1, border_color=T.BORDER, height=250)
+        their_list.pack(fill='both', expand=True)
+
+        def show_side():
+            for frame in (mine, theirs):
+                frame.pack_forget()
+            (mine if side.get().startswith('⬆') else theirs).pack(fill='both', expand=True, padx=22, pady=(8, 0))
+
+        # ------------------------------------------------------------ my side
+        def how_token():
+            webbrowser.open('https://github.com/settings/personal-access-tokens/new')
+            set_note('ในหน้าที่เปิด: ตั้งชื่ออะไรก็ได้ · Repository access = All repositories · '
+                     'Permissions > Repository > Contents = Read and write · กด Generate แล้วก๊อป token มาวาง')
+
+        def connect():
+            token = token_ent.get().strip() or sh.keyring_get()
+            if not token:
+                return set_note('ยังไม่ได้วาง token — กด "วิธีสร้าง" ถ้ายังไม่มี', T.WARN)
+            repo_name = cfg.get('share_repo') or sh.DEFAULT_REPO
+
+            def work():
+                shelf = sh.Shelf(token)
+                shelf.ensure_repo(repo_name)
+                sounds = shelf.index()['sounds']
+                fingerprints = {}
+                for row in list(self._rows()):        # cheap: a few ms per file
+                    try:
+                        fingerprints[self._key(row['path'])] = sh.sha256_of(row['path'])
+                    except OSError:
+                        pass
+                return shelf, sounds, fingerprints
+
+            def done(out):
+                shelf, sounds, fingerprints = out
+                state['shelf'], state['index'], state['sha'] = shelf, sounds, fingerprints
+                sh.keyring_set(token)
+                cfg['share_repo'] = shelf.repo
+                self.save_config()
+                token_ent.delete(0, 'end')
+                who.configure(text=f'พร้อมแล้ว · repo ส่วนตัว {shelf.repo} · มีเสียงอยู่ {len(sounds)} เสียง',
+                              text_color=T.OK)
+                code_ent.configure(state='normal')
+                code_ent.delete(0, 'end')
+                code_ent.insert(0, shelf.code())
+                code_ent.configure(state='readonly')
+                copy_btn.configure(state='normal')
+                up_all.configure(state='normal')
+                set_note('อัปเสียงทีละอันด้วยปุ่ม ⬆ ข้างชื่อ แล้วส่ง "รหัสให้เพื่อน" ไปให้เพื่อนวางในโปรแกรมของเขา')
+                draw_mine()
+
+            run_bg(work, done, 'กำลังเชื่อมกับ GitHub…')
+
+        def copy_code():
+            self.clipboard_clear()
+            self.clipboard_append(code_ent.get())
+            copy_btn.configure(text='✓')
+            win.after(1200, lambda: copy_btn.winfo_exists() and copy_btn.configure(text='คัดลอก'))
+            set_note('ก๊อปแล้ว — ส่งให้เพื่อนทาง Discord ได้เลย · ใครมีรหัสนี้เข้าถึง repo เสียงของคุณได้', T.WARN)
+
+        def draw_mine():
+            for w in my_list.winfo_children():
+                w.destroy()
+            by_sha = {e['sha256']: e for e in state['index']}
+            state['sha'] = state.get('sha', {})
+            for sound in self._rows():
+                row = ctk.CTkFrame(my_list, fg_color=T.SURFACE_2, corner_radius=9, height=40)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                digest = state['sha'].get(self._key(sound['path']))
+                up = digest in by_sha if digest else None
+                ctk.CTkLabel(row, text=sound['name'][:46], anchor='w', font=T.font(13),
+                             text_color=T.TEXT).pack(side='left', fill='x', expand=True, padx=(10, 6))
+                ctk.CTkLabel(row, text=('อัปแล้ว' if up else ''), width=58, font=T.font(11),
+                             text_color=T.OK).pack(side='right', padx=(0, 6))
+                ctk.CTkButton(row, text='⬆', width=34, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.PURPLE, text_color=T.TEXT,
+                              command=lambda s=sound: upload_one(s)).pack(side='right', padx=(0, 8))
+
+        def upload_one(sound, then=None):
+            shelf = state['shelf']
+            if shelf is None:
+                return set_note('กด "เชื่อมต่อ" ก่อน', T.WARN)
+
+            def work():
+                return shelf.upload(sound['path'], name=sound['name'],
+                                    volume=sound.get('volume', 100), on_progress=progress)
+
+            def done(out):
+                entry, how = out
+                state['sha'][self._key(sound['path'])] = entry['sha256']
+                state['index'] = [e for e in state['index'] if e['sha256'] != entry['sha256']] + [entry]
+                set_note(('อัปแล้ว: ' if how == 'added' else 'มีอยู่แล้ว: ') + sound['name'][:40], T.OK)
+                draw_mine()
+                if then:
+                    then()
+
+            run_bg(work, done, f"กำลังอัป {sound['name'][:34]} …")
+
+        def upload_rest():
+            todo = [s for s in self._rows()
+                    if state.get('sha', {}).get(self._key(s['path'])) not in {e['sha256'] for e in state['index']}]
+            if not todo:
+                return set_note('อัปครบแล้วทุกเสียง', T.OK)
+
+            def step(i=0):
+                if i >= len(todo) or not win.winfo_exists():
+                    return set_note(f'อัปครบ {len(todo)} เสียงแล้ว', T.OK)
+                upload_one(todo[i], then=lambda: step(i + 1))
+
+            step()
+
+        # ------------------------------------------------------------ friend's side
+        def open_friend():
+            code = friend_ent.get().strip() or sh.keyring_get(target='SoundSaoTer/friend')
+            try:
+                repo, token = sh.read_code(code)
+            except ValueError as exc:
+                return set_note(str(exc), T.WARN)
+
+            def work():
+                shelf = sh.Shelf(token, repo)
+                return shelf, shelf.index()['sounds']
+
+            def done(out):
+                shelf, sounds = out
+                state['friend'] = shelf
+                state['their'] = sounds
+                sh.keyring_set(code, target='SoundSaoTer/friend')
+                friend_ent.delete(0, 'end')
+                friend_who.configure(text=f'ชุดเสียงของ {repo.split("/")[0]} · {len(sounds)} เสียง')
+                down_all.configure(state='normal')
+                draw_theirs()
+                set_note('กด ⬇ ข้างเสียงที่อยากได้ · เสียงที่มีอยู่แล้วจะข้ามให้เอง')
+
+            run_bg(work, done, 'กำลังเปิดรายการเสียง…')
+
+        def draw_theirs():
+            for w in their_list.winfo_children():
+                w.destroy()
+            have = {self._key(s['path']) for s in self._rows()}
+            for entry in state.get('their', []):
+                row = ctk.CTkFrame(their_list, fg_color=T.SURFACE_2, corner_radius=9, height=40)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                got = entry.get('_local') and self._key(entry['_local']) in have
+                ctk.CTkLabel(row, text=entry['name'][:44], anchor='w', font=T.font(13),
+                             text_color=T.TEXT).pack(side='left', fill='x', expand=True, padx=(10, 6))
+                ctk.CTkLabel(row, text=f"{entry['size'] / 1048576:.1f} MB", width=58, font=T.font(11),
+                             text_color=T.TEXT_FAINT).pack(side='right', padx=(0, 4))
+                ctk.CTkLabel(row, text=('มีแล้ว' if got else ''), width=50, font=T.font(11),
+                             text_color=T.OK).pack(side='right')
+                ctk.CTkButton(row, text='⬇', width=34, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.PINK, text_color=T.TEXT,
+                              command=lambda e=entry: download_one(e)).pack(side='right', padx=(0, 8))
+
+        def download_one(entry, then=None):
+            shelf = state['friend']
+            if shelf is None:
+                return set_note('กด "ดูรายการเสียง" ก่อน', T.WARN)
+
+            def work():
+                return shelf.download(entry, SOUNDS_DIR, on_progress=progress)
+
+            def done(out):
+                path, how = out
+                entry['_local'] = path
+                added = self.add_paths([path]) if how == 'saved' else 0
+                set_note(('โหลดแล้ว: ' if how == 'saved' else 'มีอยู่แล้ว: ') + entry['name'][:40] +
+                         ('' if added or how != 'saved' else ' (อยู่ในคลังอยู่แล้ว)'), T.OK)
+                draw_theirs()
+                if then:
+                    then()
+
+            run_bg(work, done, f"กำลังโหลด {entry['name'][:34]} …")
+
+        def download_rest():
+            todo = [e for e in state.get('their', []) if not e.get('_local')]
+            if not todo:
+                return set_note('โหลดครบแล้ว', T.OK)
+
+            def step(i=0):
+                if i >= len(todo) or not win.winfo_exists():
+                    return set_note(f'โหลดครบ {len(todo)} เสียงแล้ว', T.OK)
+                download_one(todo[i], then=lambda: step(i + 1))
+
+            step()
+
+        show_side()
+        set_note('ฝั่ง "เสียงของฉัน" ต้องมี GitHub token ครั้งแรกครั้งเดียว · ฝั่ง "เสียงของเพื่อน" แค่วางรหัสที่เพื่อนส่งมา')
+        if sh.keyring_get():
+            who.configure(text='เคยเชื่อมไว้แล้ว — กด "เชื่อมต่อ" เพื่อใช้ token เดิม', text_color=T.TEXT_DIM)
 
     # ---------------------------------------------------------------- phone remote
     def _remote_css(self):

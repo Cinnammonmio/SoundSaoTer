@@ -45,6 +45,7 @@ ARGS = [
     '--collect-all', 'soundcard',       # 🎚 echo cancelling: WASAPI loopback (+ its C header files)
     '--hidden-import', 'micfx',
     '--hidden-import', 'remote',        # 📱 phone remote (stdlib web server)
+    '--hidden-import', 'soundshare',    # 🤝 sharing sounds through a private GitHub repo
     '--collect-submodules', 'segno',    # 📱 QR code
     os.path.join(HERE, 'soundboard.py'),
 ]
