@@ -81,7 +81,7 @@ def default_config():
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
         'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
-        'share_repo': '', 'tts_lang': 'ไทย', 'tts_intro': 'เหรียญ', 'tts_gap': '0.25 วิ',
+        'share_repo': '', 'sort': 'ใหม่ล่าสุด', 'tts_lang': 'ไทย', 'tts_intro': 'เหรียญ', 'tts_gap': '0.25 วิ',
     }
 
 
@@ -641,6 +641,13 @@ class App(ctk.CTk):
                                    border_color=T.BORDER, text_color=T.TEXT)
         self.search.pack(side='right')
         watch_text(self.search, self._schedule_redraw)
+        self.sort_var = ctk.StringVar(value=self.config_data.get('sort', self.SORTS[0]))
+        ctk.CTkOptionMenu(tabs, variable=self.sort_var, values=list(self.SORTS), width=124, height=38,
+                          corner_radius=9, font=T.font(13), dropdown_font=T.font(13), fg_color=T.INPUT,
+                          button_color=T.INPUT, button_hover_color=T.SURFACE_3,
+                          dropdown_fg_color=T.SURFACE_2, dropdown_hover_color=T.SURFACE_3,
+                          text_color=T.TEXT_DIM, dropdown_text_color=T.TEXT, dynamic_resizing=False,
+                          command=lambda _v: self.apply_sort()).pack(side='right', padx=(0, 8))
 
         # ---- list
         self.list = ctk.CTkScrollableFrame(
@@ -842,8 +849,39 @@ class App(ctk.CTk):
         self.say('ส่งเสียงทดสอบ 440Hz แล้ว' if played else 'ยังไม่ได้เลือกอุปกรณ์', T.WARN)
 
     # ---------------------------------------------------------------- sounds
+    SORTS = ('ใหม่ล่าสุด', 'เก่าสุด', 'ชื่อ ก-ฮ')
+
+    def _added_at(self, data):
+        """When this sound joined the library. Sounds from before 1.14.0 have no
+        stamp, so the file's own date stands in — and is written down for next time."""
+        stamp = data.get('added')
+        if not stamp:
+            try:
+                stamp = os.path.getmtime(data['path'])
+            except OSError:
+                stamp = 0.0
+            data['added'] = stamp
+        return stamp
+
+    def sorted_rows(self):
+        """(index in the library, sound) in the order the user picked. The index is the
+        real one, so removing or renaming still hits the right sound."""
+        pairs = list(enumerate(self._rows()))
+        how = self.config_data.get('sort', self.SORTS[0])
+        if how == 'ชื่อ ก-ฮ':
+            pairs.sort(key=lambda pair: pair[1]['name'].lower())
+        else:
+            pairs.sort(key=lambda pair: self._added_at(pair[1]), reverse=how != 'เก่าสุด')
+        return pairs
+
     def _rows(self):
         return self.config_data['sounds']
+
+    def apply_sort(self):
+        self.config_data['sort'] = self.sort_var.get()
+        self.save_config()
+        self.redraw()
+        self.say(f'เรียงตาม {self.sort_var.get()}')
 
     def _schedule_redraw(self):
         job = getattr(self, '_redraw_job', None)
@@ -887,7 +925,7 @@ class App(ctk.CTk):
             return
 
         shown = 0
-        for i, data in enumerate(self._rows()):
+        for i, data in self.sorted_rows():
             if needle and needle not in data['name'].lower():
                 continue
             if shown >= MAX_ROWS:
@@ -1213,7 +1251,7 @@ class App(ctk.CTk):
             used = {self._key(p) for s in self.config_data['slots'] for p in s.get('paths', [])}
             mine = {self._key(p) for p in selected()}
             out = []
-            for s in self._rows():
+            for _i, s in self.sorted_rows():
                 if needle and needle not in s['name'].lower():
                     continue
                 if want != 'ทั้งหมด' and self._source_of(s) != want:
@@ -1356,7 +1394,7 @@ class App(ctk.CTk):
         if key in known or not os.path.isfile(path):
             return False
         self._rows().append({'name': os.path.splitext(os.path.basename(path))[0],
-                             'path': path, 'hotkey': ''})
+                             'path': path, 'hotkey': '', 'added': time.time()})
         known.add(key)
         return True
 
@@ -2235,7 +2273,7 @@ class App(ctk.CTk):
             # the phone has little room: drop the file-id tags ("[522286]", "401945 - ")
             return re.sub(r'\s*\[[^\]]+\]$', '', re.sub(r'^\d+ - ', '', name)).strip() or name
 
-        rows = self._rows()
+        rows = [s for _i, s in self.sorted_rows()]
         ids = {}
         sounds = []
         for s in rows:
@@ -3579,6 +3617,14 @@ class App(ctk.CTk):
             self.after(60, self.open_settings)
 
     # ---------------------------------------------------------------- updates
+    def _later(self, call):
+        """Hand work back to the window from a worker thread — quietly does nothing if
+        the window has already closed."""
+        try:
+            self.after(0, call)
+        except (RuntimeError, tk.TclError):
+            pass
+
     def check_update(self, quiet=True):
         if not ver.UPDATE_MANIFEST_URL:
             if not quiet:
@@ -3593,9 +3639,9 @@ class App(ctk.CTk):
         def worker():
             try:
                 info = updater.check()
-                self.after(0, lambda: self._update_found(info, quiet))
+                self._later(lambda: self._update_found(info, quiet))
             except Exception as exc:
-                self.after(0, lambda: self._update_error(exc, quiet))
+                self._later(lambda: self._update_error(exc, quiet))
             finally:
                 self._checking = False
 
@@ -3715,6 +3761,7 @@ class App(ctk.CTk):
         fx.aec_device = self.config_data.get('mic_aec_device') or ''
         self._refresh_mic_fx_button()
         self.engine.exclusive = self.config_data['exclusive']
+        self.sort_var.set(self.config_data.get('sort', self.SORTS[0]))
         self.view_var.set('📚  คลังเสียง' if self.config_data.get('view') == 'library' else '🎯  ช่องคีย์ลัด')
         self.view_tabs._paint()
         self.redraw()
