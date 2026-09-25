@@ -81,7 +81,7 @@ def default_config():
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
         'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
-        'share_repo': '',
+        'share_repo': '', 'tts_lang': 'ไทย', 'tts_intro': 'เหรียญ', 'tts_gap': '0.25 วิ',
     }
 
 
@@ -661,6 +661,7 @@ class App(ctk.CTk):
             ('⭳  โหลดเสียงจากเว็บ', self.open_downloader, T.PINK, T.PINK_DARK),
             ('✂  ตัดจาก YouTube', self.open_yt_clipper, T.BLUE, T.BLUE_DARK),
             ('🤝  แชร์เสียง', self.open_share, T.INPUT, T.SURFACE_3),
+            ('🗣  พิมพ์ให้อ่าน', self.open_tts, T.INPUT, T.SURFACE_3),
         ):
             ctk.CTkButton(foot, text=text, height=44, corner_radius=10, font=T.font(14, 'bold'),
                           fg_color=fill, hover_color=hover,
@@ -1686,6 +1687,212 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(80, self._tick)
+
+    # ---------------------------------------------------------------- type-to-speak
+    def open_tts(self):
+        existing = getattr(self, '_tts_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import tts
+        cfg = self.config_data
+        win = self._dialog('พิมพ์ข้อความให้อ่าน', 640, 560, modal=False)
+        self._tts_win = win
+        state = {'busy': False, 'clip': None, 'key': None}
+
+        ctk.CTkLabel(win, text='🗣  พิมพ์ข้อความให้อ่าน (เสียงโดเนท)', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(18, 0))
+        ctk.CTkLabel(win, text='พิมพ์ข้อความ → ได้ไฟล์เสียง "แจ้งเตือน + เสียงอ่าน" เก็บไว้ในคลัง เล่นซ้ำได้ตลอด',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(anchor='w', padx=24, pady=(2, 10))
+
+        box = ctk.CTkTextbox(win, height=132, corner_radius=10, font=T.font(15), fg_color=T.INPUT,
+                             border_color=T.BORDER, border_width=1, text_color=T.TEXT, wrap='word')
+        box.pack(fill='x', padx=22)
+        count = ctk.CTkLabel(win, text='', font=T.font(11), text_color=T.TEXT_FAINT, anchor='e')
+        count.pack(fill='x', padx=26, pady=(2, 8))
+
+        opts = ctk.CTkFrame(win, fg_color=T.SURFACE, corner_radius=12, border_width=1, border_color=T.BORDER)
+        opts.pack(fill='x', padx=22)
+
+        def menu_row(label, values, value, command, width=190):
+            row = ctk.CTkFrame(opts, fg_color='transparent')
+            row.pack(fill='x', padx=16, pady=8)
+            ctk.CTkLabel(row, text=label, width=130, anchor='w', font=T.font(13),
+                         text_color=T.TEXT_DIM).pack(side='left')
+            var = ctk.StringVar(value=value if value in values else values[0])
+            ctk.CTkOptionMenu(row, variable=var, values=values, width=width, height=32, corner_radius=8,
+                              font=T.font(13), dropdown_font=T.font(13), fg_color=T.INPUT,
+                              button_color=T.INPUT, button_hover_color=T.SURFACE_3,
+                              dropdown_fg_color=T.SURFACE_2, dropdown_hover_color=T.SURFACE_3,
+                              text_color=T.TEXT, dropdown_text_color=T.TEXT, dynamic_resizing=False,
+                              command=lambda _v: command()).pack(side='left')
+            return row, var
+
+        langs = [name for name, _code in tts.LANGS]
+        _r, lang_var = menu_row('ภาษา', langs, cfg.get('tts_lang', 'ไทย'), lambda: changed())
+        mine = [s['name'] for s in self._rows()][:40]
+        intro_values = ['ไม่มี'] + tts.CHIMES + (['— เสียงในคลัง —'] + mine if mine else [])
+        intro_row, intro_var = menu_row('เสียงแจ้งเตือน', intro_values, cfg.get('tts_intro', 'เหรียญ'),
+                                        lambda: changed(), width=250)
+        ctk.CTkButton(intro_row, text='▶', width=34, height=32, corner_radius=8, font=T.font(12),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: preview_intro()).pack(side='left', padx=(8, 0))
+        gaps = ['ไม่เว้น', '0.25 วิ', '0.5 วิ', '1 วิ']
+        _r2, gap_var = menu_row('เว้นก่อนเริ่มอ่าน', gaps, cfg.get('tts_gap', '0.25 วิ'), lambda: changed())
+
+        bar = ctk.CTkProgressBar(win, height=8, corner_radius=4, fg_color=T.INPUT, progress_color=T.PINK)
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
+                            anchor='w', wraplength=580)
+        note.pack(side='bottom', fill='x', padx=26, pady=(6, 14))
+
+        act = ctk.CTkFrame(win, fg_color='transparent')
+        act.pack(side='bottom', fill='x', padx=22, pady=(4, 2))
+        ctk.CTkButton(act, text='▶  ฟังตัวอย่าง', width=150, height=40, corner_radius=9,
+                      font=T.font(14, 'bold'), fg_color=T.PURPLE, hover_color=T.PURPLE_DARK,
+                      text_color=T.ON_ACCENT, command=lambda: do_preview()).pack(side='left')
+        ctk.CTkButton(act, text='💾  บันทึกลงคลังเสียง', width=190, height=40, corner_radius=9,
+                      font=T.font(14, 'bold'), fg_color=T.PINK, hover_color=T.PINK_DARK,
+                      text_color=T.ON_ACCENT, command=lambda: do_save()).pack(side='right')
+        ctk.CTkButton(act, text='🎮  เล่นเข้าเกมเลย', width=160, height=40, corner_radius=9,
+                      font=T.font(14), fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                      command=lambda: do_play()).pack(side='right', padx=(0, 10))
+
+        HINT = ('เสียงอ่านมาจาก Google Translate (ต้องต่อเน็ต) · ข้อความยาวจะถูกตัดเป็นท่อนให้เอง · '
+                'บันทึกแล้วเอาไปใส่ slot เพื่อกดจากปุ่มลัดได้')
+
+        def set_note(text=None, tone=None):
+            if win.winfo_exists():
+                note.configure(text=text or HINT, text_color=tone or T.TEXT_FAINT)
+
+        def text_now():
+            return box.get('1.0', 'end').strip()
+
+        def settings():
+            lang = dict(tts.LANGS)[lang_var.get()]
+            intro = intro_var.get()
+            if intro in ('ไม่มี', '— เสียงในคลัง —'):
+                intro = None
+            elif intro not in tts.CHIMES:
+                sound = next((s for s in self._rows() if s['name'] == intro), None)
+                intro = sound['path'] if sound else None
+            gap = {'ไม่เว้น': 0.0, '0.25 วิ': 0.25, '0.5 วิ': 0.5, '1 วิ': 1.0}[gap_var.get()]
+            return lang, intro, gap
+
+        def changed():
+            cfg.update(tts_lang=lang_var.get(), tts_intro=intro_var.get(), tts_gap=gap_var.get())
+            self.save_config()
+            state['clip'] = None                # options changed: build it again
+
+        def tick_count(*_):
+            n = len(text_now())
+            count.configure(text=f'{n} / {tts.MAX_CHARS} ตัวอักษร' + (f'  ·  ตัด {len(tts.split_text(text_now()))} ท่อน'
+                                                                     if n > tts.CHUNK_CHARS else ''),
+                            text_color=T.DANGER if n > tts.MAX_CHARS else T.TEXT_FAINT)
+            state['clip'] = None
+        box.bind('<KeyRelease>', tick_count)
+
+        def progress(done, total):
+            def paint():
+                if not win.winfo_exists():
+                    return
+                if total > 1 and done < total:
+                    bar.pack(fill='x', padx=24, pady=(0, 4), before=note)
+                    bar.set(done / total)
+                    set_note(f'กำลังขอเสียงอ่าน ท่อนที่ {done + 1} จาก {total} …', T.WARN)
+                else:
+                    bar.pack_forget()
+            self.after(0, paint)
+
+        def build_then(done_with):
+            """Build once and remember it — preview, play and save share the same clip."""
+            text = text_now()
+            if not text:
+                return set_note('พิมพ์ข้อความก่อน', T.WARN)
+            lang, intro, gap = settings()
+            key = (text, lang, intro, gap)
+            if state['clip'] is not None and state['key'] == key:
+                return done_with(state['clip'])
+            if state['busy']:
+                return set_note('กำลังทำอยู่ รอสักครู่', T.WARN)
+            state['busy'] = True
+            set_note('กำลังขอเสียงอ่าน…', T.WARN)
+
+            def worker():
+                fell_back = False
+                try:
+                    clip = tts.build(text, lang, intro, gap, on_progress=progress)
+                except ValueError as exc:            # the text itself is the problem
+                    return self.after(0, lambda: finish(None, exc, False))
+                except Exception as google_failed:
+                    try:                             # no internet / Google said no: use Windows' own voice
+                        clip = tts.build(text, lang, intro, gap, use_google=False)
+                        fell_back = True
+                    except Exception:
+                        return self.after(0, lambda: finish(None, google_failed, False))
+                self.after(0, lambda: finish(clip, None, fell_back))
+
+            def finish(clip, exc, fell_back=False):
+                state['busy'] = False
+                bar.pack_forget()
+                if exc is not None:
+                    return set_note(str(exc), T.DANGER)
+                state['clip'], state['key'] = clip, key
+                if fell_back:
+                    set_note('Google ใช้ไม่ได้ตอนนี้ — ใช้เสียงอ่านของ Windows แทน', T.WARN)
+                done_with(clip)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def do_preview():
+            def play(clip):
+                audio, rate = clip
+                try:
+                    where = self.engine.preview_data(audio, rate)
+                    set_note(f'ฟังทาง {where} (ไม่เข้าเกม) · ยาว {len(audio) / rate:.1f} วินาที', T.OK)
+                except Exception as exc:
+                    set_note(str(exc), T.WARN)
+            build_then(play)
+
+        def preview_intro():
+            _lang, intro, _gap = settings()
+            if not intro:
+                return set_note('ยังไม่ได้เลือกเสียงแจ้งเตือน', T.WARN)
+            try:
+                audio = tts.intro_audio(intro)
+                self.engine.preview_data(audio, tts.RATE)
+                set_note('ฟังเสียงแจ้งเตือนทางหูฟัง', T.OK)
+            except Exception as exc:
+                set_note(str(exc), T.WARN)
+
+        def do_play():
+            def play(clip):
+                audio, rate = clip
+                path = save_clip(clip, quiet=True)
+                if path:
+                    self.play_path(path)
+                    set_note(f'เล่นเข้าเกมแล้ว · บันทึกไว้เป็น {os.path.basename(path)}', T.OK)
+            build_then(play)
+
+        def save_clip(clip, quiet=False):
+            audio, rate = clip
+            try:
+                path = tts.save(audio, rate, tts.filename_for(text_now(), SOUNDS_DIR))
+            except Exception as exc:
+                set_note(f'บันทึกไม่ได้: {exc}', T.DANGER)
+                return None
+            self.add_paths([path])
+            if not quiet:
+                set_note(f'บันทึกแล้ว: {os.path.basename(path)} · ไปใส่ slot ได้เลย', T.OK)
+            return path
+
+        def do_save():
+            build_then(lambda clip: save_clip(clip))
+
+        tick_count()
+        set_note()
+        win.after(200, lambda: box.focus_set())
 
     # ---------------------------------------------------------------- share sounds
     def open_share(self):

@@ -46,6 +46,7 @@ ARGS = [
     '--hidden-import', 'micfx',
     '--hidden-import', 'remote',        # 📱 phone remote (stdlib web server)
     '--hidden-import', 'soundshare',    # 🤝 sharing sounds through a private GitHub repo
+    '--hidden-import', 'tts',           # 🗣 type-to-speak (Google Translate voice)
     '--collect-submodules', 'segno',    # 📱 QR code
     os.path.join(HERE, 'soundboard.py'),
 ]
