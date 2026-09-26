@@ -76,7 +76,7 @@ def default_config():
         'exclusive': True, 'hotkeys_enabled': True, 'tray': True, 'tray_notified': False,
         'stop_hotkey': 'ctrl+alt+s', 'sounds': [],
         'hear_self': False, 'auto_update': True, 'color': T.DEFAULT, 'mode': 'dark',
-        'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
+        'full_effect': True, 'trim_silence': True, 'normalize': True, 'cooldown': 2.0, 'random_hotkey': '',
         'cache_mb': 40, 'slots': [], 'view': 'slots',
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
@@ -3457,8 +3457,10 @@ class App(ctk.CTk):
 
     # ---------------------------------------------------------------- settings
     def _apply_sound_processing(self):
-        self.engine.cache.set_processing(bool(self.config_data.get('trim_silence', True)),
-                                         bool(self.config_data.get('normalize', True)))
+        # "เต็ม 100%" wins over the two tidy-up switches: nothing is cut or re-levelled
+        full = bool(self.config_data.get('full_effect', True))
+        self.engine.cache.set_processing(not full and bool(self.config_data.get('trim_silence', True)),
+                                         not full and bool(self.config_data.get('normalize', True)))
         self.engine.cache.budget = int(self.config_data.get('cache_mb', 40)) * 1024 * 1024
 
     def open_settings(self):
@@ -3488,6 +3490,7 @@ class App(ctk.CTk):
                                text_color=T.TEXT_DIM, progress_color=T.PURPLE, fg_color=T.INPUT,
                                button_color=T.TEXT, button_hover_color=T.PINK, state=state)
             sw.pack(anchor='w', padx=18, pady=(8, 0))
+            return sw
             return var, sw
 
         section('สีธีม', 'เปลี่ยนทันที ใช้ได้ทั้งโหมดมืดและสว่าง (สลับโหมดที่ปุ่มขวาบน)')
@@ -3519,9 +3522,22 @@ class App(ctk.CTk):
                     pass
 
         section('ประมวลผลเสียง', 'ทำครั้งเดียวตอนโหลดไฟล์ ไม่เพิ่มงานตอนเล่น')
-        switch('ตัดช่วงเงียบหัวท้าย — กดแล้วเสียงออกทันที', 'trim_silence',
-               lambda _v: self._apply_sound_processing())
-        switch('ปรับทุกเสียงให้ดังพอ ๆ กัน', 'normalize', lambda _v: self._apply_sound_processing())
+        sw_full = switch('ส่งเสียงเต็ม 100% — ไม่ตัดหัวท้าย ไม่หรี่ความดัง (แนะนำ)', 'full_effect',
+                         lambda _v: full_changed())
+        sw_trim = switch('ตัดช่วงเงียบหัวท้าย — กดแล้วเสียงออกทันที', 'trim_silence',
+                         lambda _v: self._apply_sound_processing())
+        sw_norm = switch('ปรับทุกเสียงให้ดังพอ ๆ กัน', 'normalize',
+                         lambda _v: self._apply_sound_processing())
+
+        def full_changed():
+            full = bool(self.config_data.get('full_effect', True))
+            for sw in (sw_trim, sw_norm):
+                sw.configure(state='disabled' if full else 'normal',
+                             text_color=T.TEXT_FAINT if full else T.TEXT_DIM)
+            self._apply_sound_processing()
+            self.say('ส่งเสียงเต็มไฟล์ 100% แล้ว' if full else 'กลับไปใช้การตัด/ปรับดังตามสวิตช์ด้านล่าง', T.OK)
+
+        full_changed()
 
         section('กันสแปม', 'เว้นระยะขั้นต่ำระหว่างเสียงที่กดจากคีย์ลัด (กดในหน้าต่างไม่ถูกจำกัด)')
         gaps = {'ปิด': 0.0, '1 วิ': 1.0, '2 วิ': 2.0, '3 วิ': 3.0, '5 วิ': 5.0}
