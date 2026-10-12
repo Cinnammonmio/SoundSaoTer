@@ -533,28 +533,66 @@ class Engine:
             player.close()
 
 
-def list_output_devices():
+API_RANK = {'Windows WASAPI': 0, 'Windows DirectSound': 1, 'MME': 2, 'Windows WDM-KS': 3}
+NAME_MATCH = 28          # MME cuts device names at 31 characters: compare only the start
+ALIAS_NAMES = ('microsoft sound mapper', 'primary sound driver', 'primary sound capture')
+
+
+def _label(found):
+    return [(idx, f'{name}  [{api}]') for idx, name, api in found]
+
+
+def _covers(name, others):
+    """True if this name is the same device as one of `others`, allowing for the
+    shortened names MME reports."""
+    low = (name or '').strip().lower()
+    for other in others:
+        n = min(len(low), len(other), NAME_MATCH)
+        if n and low[:n] == other[:n]:
+            return True
+    return False
+
+
+def _tidy(found):
+    """One row per real device instead of the same speaker four times.
+
+    Windows offers every device once per host API (WASAPI, DirectSound, MME, WDM-KS),
+    which turns the menu into a wall of duplicates. Keep the WASAPI copy — the one
+    Windows itself uses — plus anything no WASAPI row covers. WDM-KS is dropped: it
+    takes the device exclusively and usually refuses to open while Windows has it.
+    """
+    found = [f for f in found if not _covers(f[1], ALIAS_NAMES)]
+    wasapi = [f for f in found if f[2] == 'Windows WASAPI']
+    names = [f[1].strip().lower() for f in wasapi]
+    out = list(wasapi)
+    for idx, name, api in found:
+        if api == 'Windows WASAPI' or api == 'Windows WDM-KS' or _covers(name, names):
+            continue
+        out.append((idx, name, api))
+    out.sort(key=lambda f: (API_RANK.get(f[2], 9), f[1].lower()))
+    return out
+
+
+def _list_devices(channels, tidy=True):
+    out = []
+    apis = sd.query_hostapis()
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev[channels] < 1:
+            continue
+        out.append((idx, str(dev['name']).strip(), apis[dev['hostapi']]['name']))
+    if not tidy:
+        return _label(out)
+    return _label(_tidy(out) or out)        # never hand back an empty menu
+
+
+def list_output_devices(tidy=True):
     """[(index, label)] for every output device, host API included in the label."""
-    out = []
-    apis = sd.query_hostapis()
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev['max_output_channels'] < 1:
-            continue
-        api = apis[dev['hostapi']]['name']
-        out.append((idx, f"{dev['name']}  [{api}]"))
-    return out
+    return _list_devices('max_output_channels', tidy)
 
 
-def list_input_devices():
+def list_input_devices(tidy=True):
     """[(index, label)] for every recording device, host API included in the label."""
-    out = []
-    apis = sd.query_hostapis()
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev['max_input_channels'] < 1:
-            continue
-        api = apis[dev['hostapi']]['name']
-        out.append((idx, f"{dev['name']}  [{api}]"))
-    return out
+    return _list_devices('max_input_channels', tidy)
 
 
 def default_input_device():
@@ -622,7 +660,7 @@ def safe_monitor_device(exclude=()):
     playback device, so falling back to the default blindly would send a preview
     straight into the game.
     """
-    devices = list_output_devices()
+    devices = list_output_devices(tidy=False)   # here any API will do, as long as it opens
     labels = dict(devices)
 
     def usable(idx):

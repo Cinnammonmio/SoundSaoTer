@@ -81,6 +81,7 @@ def default_config():
         'mic_denoise': False, 'mic_gate': False, 'mic_gate_sens': 50, 'mic_agc': False,
         'mic_aec': False, 'mic_aec_device': '',
         'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
+        'all_devices': False,
         'share_repo': '', 'sort': 'ใหม่ล่าสุด', 'tts_lang': 'ไทย', 'tts_intro': 'เหรียญ', 'tts_gap': '0.25 วิ',
     }
 
@@ -412,12 +413,26 @@ class DeviceRow:
         values = ([NONE_LABEL] if include_none else []) + list(self.map)
         self.menu.configure(values=values or [NONE_LABEL])
         short_keep = T.short_device(keep) if keep else ''
+        moved = self._same_device(short_keep) if short_keep and short_keep not in self.map else None
         if short_keep in self.map:
             self.var.set(short_keep)
+        elif moved:                       # saved under a host API the menu no longer shows
+            self.var.set(moved)
         elif not include_none and values:
             self.var.set(values[0])
         else:
             self.var.set(NONE_LABEL)
+
+    def _same_device(self, short_keep):
+        """The same speaker/mic, listed under another host API — what a pick saved
+        before the menu was tidied up points at."""
+        want = short_keep.split(' · ')[0].strip().lower()
+        for short in self.map:
+            name = short.split(' · ')[0].strip().lower()
+            n = min(len(name), len(want), ae.NAME_MATCH)
+            if n and name[:n] == want[:n]:
+                return short
+        return None
 
     def selected_index(self):
         return self.map.get(self.var.get())
@@ -736,8 +751,9 @@ class App(ctk.CTk):
             sd._initialize()
         except Exception:
             pass
-        self.devices = ae.list_output_devices()
-        self.inputs = ae.list_input_devices()
+        tidy = not self.config_data.get('all_devices')
+        self.devices = ae.list_output_devices(tidy)
+        self.inputs = ae.list_input_devices(tidy)
 
         self.dev_game.set_options(self.devices, False, self.config_data.get('game_device'))
         self.dev_mon.set_options(self.devices, True, self.config_data.get('monitor_device'))
@@ -3520,6 +3536,16 @@ class App(ctk.CTk):
                     w.configure(cursor='hand2')
                 except Exception:
                     pass
+
+        section('รายชื่ออุปกรณ์เสียง', 'ปกติ Windows โชว์ลำโพงตัวเดียวซ้ำ 4 รอบ (WASAPI/DirectSound/MME/WDM-KS) '
+                'โปรแกรมจึงเหลือไว้แค่ WASAPI ที่ Windows ใช้จริง')
+        switch('แสดงทุกอุปกรณ์ทุกระบบ (ยาวแต่ครบ — เปิดถ้าหาอุปกรณ์ที่ต้องการไม่เจอ)', 'all_devices',
+               lambda _v: devices_changed(), default=False)
+
+        def devices_changed():
+            self.refresh_devices()
+            n = len(self.devices) + len(self.inputs)
+            self.say(f'รายชื่ออุปกรณ์: {n} รายการ' + ('' if self.config_data.get('all_devices') else ' (กรองแล้ว)'), T.OK)
 
         section('ประมวลผลเสียง', 'ทำครั้งเดียวตอนโหลดไฟล์ ไม่เพิ่มงานตอนเล่น')
         sw_full = switch('ส่งเสียงเต็ม 100% — ไม่ตัดหัวท้าย ไม่หรี่ความดัง (แนะนำ)', 'full_effect',
