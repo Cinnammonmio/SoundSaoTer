@@ -146,7 +146,7 @@ def peek_theme():
     """(colour, mode) from config.json — needed before any widget exists.
     Configs from v1.1-v1.3 only have a single 'theme' name; translate that."""
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as fh:
+        with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as fh:   # -sig: ยอมรับไฟล์ที่ Notepad ใส่ BOM มา
             data = json.load(fh)
     except Exception:
         return T.DEFAULT, 'dark'
@@ -4131,7 +4131,7 @@ class App(ctk.CTk):
     def load_config(self):
         if os.path.isfile(CONFIG_PATH):
             try:
-                with open(CONFIG_PATH, 'r', encoding='utf-8') as fh:
+                with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as fh:   # -sig: ยอมรับไฟล์ที่ Notepad ใส่ BOM มา
                     data = json.load(fh)
                 cfg = default_config()
                 cfg.update({k: v for k, v in data.items() if k in cfg})
