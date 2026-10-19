@@ -82,6 +82,7 @@ def default_config():
         'mic_aec': False, 'mic_aec_device': '',
         'remote_enabled': False, 'remote_key': '', 'remote_port': 8765, 'prewarm': True,
         'all_devices': False,
+        'hub_server': '', 'hub_by': '',
         'share_repo': '', 'sort': 'ใหม่ล่าสุด', 'tts_lang': 'ไทย', 'tts_intro': 'เหรียญ', 'tts_gap': '0.25 วิ',
     }
 
@@ -642,6 +643,9 @@ class App(ctk.CTk):
         ctk.CTkButton(top, text='📱  มือถือ', width=104, height=36, corner_radius=9, font=T.font(14),
                       fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
                       command=self.open_remote).pack(side='right', padx=(0, 4))
+        ctk.CTkButton(top, text='🌐  คลังกลาง', width=122, height=36, corner_radius=9, font=T.font(14),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=self.open_hub).pack(side='right', padx=(0, 6))
 
         tabs = ctk.CTkFrame(bar, fg_color='transparent')
         tabs.grid(row=1, column=0, sticky='ew', pady=(0, 8))
@@ -2272,6 +2276,368 @@ class App(ctk.CTk):
         set_note('ฝั่ง "เสียงของฉัน" ต้องมี GitHub token ครั้งแรกครั้งเดียว · ฝั่ง "เสียงของเพื่อน" แค่วางรหัสที่เพื่อนส่งมา')
         if sh.keyring_get():
             who.configure(text='เคยเชื่อมไว้แล้ว — กด "เชื่อมต่อ" เพื่อใช้ token เดิม', text_color=T.TEXT_DIM)
+
+    # ---------------------------------------------------------------- central library
+    def open_hub(self):
+        """คลังเสียงกลาง — ใครเปิดโปรแกรมก็โหลดได้ ส่งเข้าคลังได้ รอเจ้าของคลังตรวจก่อนขึ้น"""
+        existing = getattr(self, '_hub_win', None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        import hub
+        cfg = self.config_data
+        win = self._dialog('คลังเสียงกลาง', 700, 780, modal=False)
+        self._hub_win = win
+        state = {'index': [], 'queue': [], 'busy': False, 'sent': set(),
+                 'key': hub.admin_key_get()}
+
+        ctk.CTkLabel(win, text='🌐  คลังเสียงกลาง', font=T.font(18, 'bold'),
+                     text_color=T.TEXT).pack(anchor='w', padx=24, pady=(18, 0))
+        ctk.CTkLabel(win, text='เสียงที่ทุกคนช่วยกันส่งเข้ามา โหลดได้เลยไม่ต้องล็อกอิน · '
+                               'ส่งเสียงเข้าคลังได้ รอเจ้าของคลังตรวจก่อนขึ้นจริง',
+                     font=T.font(12), text_color=T.TEXT_FAINT).pack(anchor='w', padx=24, pady=(2, 10))
+
+        side = ctk.StringVar(value='⬇  โหลดจากคลัง')
+        tabs = ToggleGroup(win, ['⬇  โหลดจากคลัง', '⬆  ส่งเสียงเข้าคลัง', '🛠  ผู้ดูแล'], side,
+                           command=lambda _v: show_side())
+        for b in tabs.buttons.values():
+            b.configure(width=160)
+        tabs.pack(anchor='w', padx=22)
+
+        browse = ctk.CTkFrame(win, fg_color='transparent')
+        send = ctk.CTkFrame(win, fg_color='transparent')
+        admin = ctk.CTkFrame(win, fg_color='transparent')
+        note = ctk.CTkLabel(win, text='', font=T.font(12), text_color=T.TEXT_FAINT, justify='left',
+                            anchor='w', wraplength=630)
+        note.pack(side='bottom', fill='x', padx=24, pady=(6, 14))
+        bar = ctk.CTkProgressBar(win, height=8, corner_radius=4, fg_color=T.INPUT, progress_color=T.PINK)
+
+        def set_note(text, tone=None):
+            if win.winfo_exists():
+                note.configure(text=text, text_color=tone or T.TEXT_FAINT)
+
+        def progress(done, total):
+            def paint():
+                if not win.winfo_exists():
+                    return
+                if total and done < total:
+                    bar.pack(fill='x', padx=24, pady=(0, 4), before=note)
+                    bar.set(done / total)
+                else:
+                    bar.pack_forget()
+            self._later(paint)
+
+        def run_bg(work, done=None, busy_text=''):
+            """เน็ตทำงานนอกเธรดหน้าต่าง ผลลัพธ์ค่อยวิ่งกลับมาทาง after()"""
+            if state['busy']:
+                return set_note('รออันที่กำลังทำอยู่ให้เสร็จก่อน', T.WARN)
+            state['busy'] = True
+            if busy_text:
+                set_note(busy_text, T.WARN)
+
+            def worker():
+                try:
+                    out = work()
+                    self._later(lambda: finish(out, None))
+                except Exception as exc:
+                    self._later(lambda: finish(None, exc))
+
+            def finish(out, exc):
+                state['busy'] = False
+                bar.pack_forget()
+                if exc is not None:
+                    return set_note(hub.friendly_error(exc), T.DANGER)
+                if done:
+                    done(out)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def server():
+            return (cfg.get('hub_server') or hub.DEFAULT_SERVER).strip()
+
+        # ============================================================ โหลดจากคลัง
+        find_row = ctk.CTkFrame(browse, fg_color='transparent')
+        find_row.pack(fill='x', pady=(12, 8))
+        find = ctk.CTkEntry(find_row, height=36, corner_radius=8, font=T.font(13), fg_color=T.INPUT,
+                            border_color=T.BORDER, text_color=T.TEXT,
+                            placeholder_text='ค้นหาในคลัง…')
+        find.pack(side='left', fill='x', expand=True)
+        watch_text(find, lambda: draw_index())
+        ctk.CTkButton(find_row, text='รีเฟรช', width=90, height=36, corner_radius=8, font=T.font(13),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                      command=lambda: load_index()).pack(side='left', padx=(8, 0))
+        hub_list = ctk.CTkScrollableFrame(browse, fg_color=T.SURFACE, corner_radius=12,
+                                          border_width=1, border_color=T.BORDER, height=430)
+        hub_list.pack(fill='both', expand=True)
+
+        def load_index():
+            run_bg(lambda: hub.index(), set_index, 'กำลังอ่านรายการจากคลัง…')
+
+        def set_index(data):
+            state['index'] = hub.newest_first(data.get('sounds', []))
+            draw_index()
+            set_note(f"คลังมี {len(state['index'])} เสียง — กด ⬇ เสียงที่อยากได้" if state['index']
+                     else 'คลังยังว่างอยู่ — ส่งเสียงแรกเข้ามาได้ที่แท็บ "ส่งเสียงเข้าคลัง"', T.OK)
+
+        def draw_index():
+            for w in hub_list.winfo_children():
+                w.destroy()
+            needle = find.get().strip().lower()
+            have = {self._key(s['path']) for s in self._rows()}
+            shown = [e for e in state['index']
+                     if not needle or needle in e.get('name', '').lower() or needle in e.get('by', '').lower()]
+            for entry in shown[:300]:
+                row = ctk.CTkFrame(hub_list, fg_color=T.SURFACE_2, corner_radius=9, height=42)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                got = entry.get('_local') and self._key(entry['_local']) in have
+                who = f"  · {entry['by']}" if entry.get('by') else ''
+                ctk.CTkLabel(row, text=(entry.get('name') or '')[:44] + who, anchor='w', font=T.font(13),
+                             text_color=T.TEXT).pack(side='left', fill='x', expand=True, padx=(10, 6))
+                ctk.CTkLabel(row, text=f"{entry.get('size', 0) / 1048576:.1f} MB", width=58,
+                             font=T.font(11), text_color=T.TEXT_FAINT).pack(side='right', padx=(0, 4))
+                ctk.CTkLabel(row, text=('มีแล้ว' if got else ''), width=46, font=T.font(11),
+                             text_color=T.OK).pack(side='right')
+                ctk.CTkButton(row, text='⬇', width=34, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.PINK, text_color=T.TEXT,
+                              command=lambda e=entry: grab(e)).pack(side='right', padx=(0, 8))
+                if state['key']:
+                    ctk.CTkButton(row, text='✕', width=30, height=28, corner_radius=8, font=T.font(13),
+                                  fg_color=T.INPUT, hover_color=T.DANGER, text_color=T.TEXT_DIM,
+                                  command=lambda e=entry: take_down(e)).pack(side='right', padx=(0, 6))
+            if not shown:
+                ctk.CTkLabel(hub_list, text='ไม่มีเสียงที่ตรงกับคำค้น' if needle else 'ยังไม่มีเสียงในคลัง',
+                             font=T.font(13), text_color=T.TEXT_FAINT).pack(pady=20)
+
+        def grab(entry):
+            def done(out):
+                path, how = out
+                entry['_local'] = path
+                added = self.add_paths([path]) if how == 'saved' else 0
+                set_note(('โหลดแล้ว: ' if how == 'saved' else 'มีอยู่แล้ว: ') + entry['name'][:40] +
+                         ('' if added or how != 'saved' else ' (อยู่ในคลังเครื่องอยู่แล้ว)'), T.OK)
+                draw_index()
+
+            run_bg(lambda: hub.download(entry, SOUNDS_DIR, progress), done,
+                   f"กำลังโหลด {entry['name'][:34]} …")
+
+        def take_down(entry):
+            def done(_out):
+                state['index'] = [e for e in state['index'] if e['id'] != entry['id']]
+                draw_index()
+                set_note(f"เอา {entry['name'][:34]} ออกจากคลังแล้ว", T.OK)
+
+            run_bg(lambda: hub.remove(server(), state['key'], entry['id']), done, 'กำลังเอาออก…')
+
+        # ============================================================ ส่งเสียงเข้าคลัง
+        by_row = ctk.CTkFrame(send, fg_color='transparent')
+        by_row.pack(fill='x', pady=(12, 8))
+        ctk.CTkLabel(by_row, text='ชื่อคนส่ง', width=70, anchor='w', font=T.font(12),
+                     text_color=T.TEXT_DIM).pack(side='left')
+        by_ent = ctk.CTkEntry(by_row, height=34, corner_radius=8, font=T.font(13), fg_color=T.INPUT,
+                              border_color=T.BORDER, text_color=T.TEXT,
+                              placeholder_text='ชื่อเล่นที่จะโชว์ข้างเสียง (ไม่ใส่ก็ได้)')
+        by_ent.pack(side='left', fill='x', expand=True)
+        by_ent.insert(0, cfg.get('hub_by', ''))
+        watch_text(by_ent, lambda: save_by())
+        mine_list = ctk.CTkScrollableFrame(send, fg_color=T.SURFACE, corner_radius=12,
+                                           border_width=1, border_color=T.BORDER, height=450)
+        mine_list.pack(fill='both', expand=True)
+
+        def save_by():
+            cfg['hub_by'] = by_ent.get().strip()[:24]
+            job = getattr(win, '_by_job', None)
+            if job:
+                win.after_cancel(job)
+            win._by_job = win.after(600, self.save_config)
+
+        def draw_mine():
+            for w in mine_list.winfo_children():
+                w.destroy()
+            in_hub = {e['sha256'] for e in state['index']}
+            for _i, sound in self.sorted_rows():
+                row = ctk.CTkFrame(mine_list, fg_color=T.SURFACE_2, corner_radius=9, height=42)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                key = self._key(sound['path'])
+                mark = 'ส่งแล้ว' if key in state['sent'] else ('อยู่ในคลัง' if state.get('sha', {}).get(key) in in_hub else '')
+                ctk.CTkLabel(row, text=sound['name'][:44], anchor='w', font=T.font(13),
+                             text_color=T.TEXT).pack(side='left', fill='x', expand=True, padx=(10, 6))
+                ctk.CTkLabel(row, text=mark, width=66, font=T.font(11),
+                             text_color=T.OK).pack(side='right', padx=(0, 6))
+                ctk.CTkButton(row, text='⬆', width=34, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.PURPLE, text_color=T.TEXT,
+                              command=lambda s=sound: send_one(s)).pack(side='right', padx=(0, 8))
+            if not self._rows():
+                ctk.CTkLabel(mine_list, text='ยังไม่มีเสียงในเครื่อง — เพิ่มเสียงก่อนถึงจะส่งเข้าคลังได้',
+                             font=T.font(13), text_color=T.TEXT_FAINT).pack(pady=20)
+
+        def send_one(sound):
+            if not server():
+                return set_note('ยังไม่ได้ตั้งที่อยู่เซิร์ฟเวอร์ของคลังกลาง — ดูแท็บ "ผู้ดูแล"', T.WARN)
+
+            def done(out):
+                status = out.get('status')
+                state['sent'].add(self._key(sound['path']))
+                set_note({'pending': 'ส่งเข้าคิวแล้ว รอเจ้าของคลังตรวจ: ',
+                          'already': 'มีเสียงนี้ในคลังอยู่แล้ว: '}.get(status, 'ส่งแล้ว: ')
+                         + sound['name'][:40], T.OK)
+                draw_mine()
+
+            run_bg(lambda: hub.submit(sound['path'], sound['name'], cfg.get('hub_by', ''),
+                                      server(), progress),
+                   done, f"กำลังส่ง {sound['name'][:34]} …")
+
+        # ============================================================ ผู้ดูแล
+        cfg_box = ctk.CTkFrame(admin, fg_color=T.SURFACE, corner_radius=12,
+                               border_width=1, border_color=T.BORDER)
+        cfg_box.pack(fill='x', pady=(12, 8))
+        srow = ctk.CTkFrame(cfg_box, fg_color='transparent')
+        srow.pack(fill='x', padx=14, pady=(12, 6))
+        ctk.CTkLabel(srow, text='ที่อยู่เซิร์ฟเวอร์', width=108, anchor='w', font=T.font(12),
+                     text_color=T.TEXT_DIM).pack(side='left')
+        srv_ent = ctk.CTkEntry(srow, height=32, corner_radius=8, font=T.font(12), fg_color=T.INPUT,
+                               border_color=T.BORDER, text_color=T.TEXT,
+                               placeholder_text='https://soundsaoter-hub.xxx.workers.dev')
+        srv_ent.pack(side='left', fill='x', expand=True)
+        srv_ent.insert(0, cfg.get('hub_server', ''))
+        krow = ctk.CTkFrame(cfg_box, fg_color='transparent')
+        krow.pack(fill='x', padx=14, pady=(0, 6))
+        ctk.CTkLabel(krow, text='กุญแจผู้ดูแล', width=108, anchor='w', font=T.font(12),
+                     text_color=T.TEXT_DIM).pack(side='left')
+        key_ent = ctk.CTkEntry(krow, height=32, corner_radius=8, font=T.font(12), show='•',
+                               fg_color=T.INPUT, border_color=T.BORDER, text_color=T.TEXT,
+                               placeholder_text='ว่างไว้ถ้าไม่ได้เป็นคนดูแลคลัง')
+        key_ent.pack(side='left', fill='x', expand=True)
+        if state['key']:
+            key_ent.insert(0, state['key'])
+        brow = ctk.CTkFrame(cfg_box, fg_color='transparent')
+        brow.pack(fill='x', padx=14, pady=(0, 12))
+        ctk.CTkButton(brow, text='บันทึกและทดสอบ', width=140, height=32, corner_radius=8,
+                      font=T.font(12, 'bold'), fg_color=T.PURPLE, hover_color=T.PURPLE_DARK,
+                      text_color=T.ON_ACCENT, command=lambda: save_admin()).pack(side='left')
+        ctk.CTkButton(brow, text='วิธีตั้งเซิร์ฟเวอร์', width=130, height=32, corner_radius=8,
+                      font=T.font(12), fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                      command=lambda: webbrowser.open(hub.PAGE_URL)).pack(side='left', padx=(8, 0))
+        qhead = ctk.CTkFrame(admin, fg_color='transparent')
+        qhead.pack(fill='x', pady=(2, 4))
+        ctk.CTkLabel(qhead, text='เสียงที่รอตรวจ', font=T.font(13, 'bold'),
+                     text_color=T.TEXT).pack(side='left')
+        ctk.CTkButton(qhead, text='โหลดคิว', width=100, height=30, corner_radius=8, font=T.font(12),
+                      fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT,
+                      command=lambda: load_queue()).pack(side='right')
+        queue_list = ctk.CTkScrollableFrame(admin, fg_color=T.SURFACE, corner_radius=12,
+                                            border_width=1, border_color=T.BORDER, height=300)
+        queue_list.pack(fill='both', expand=True)
+
+        def save_admin():
+            cfg['hub_server'] = srv_ent.get().strip().rstrip('/')
+            state['key'] = key_ent.get().strip()
+            try:
+                if state['key']:
+                    hub.admin_key_set(state['key'])
+                else:
+                    hub.admin_key_clear()
+            except ValueError as exc:
+                state['key'] = ''
+                return set_note(str(exc), T.WARN)
+            self.save_config()
+            if not server():
+                return set_note('ใส่ที่อยู่เซิร์ฟเวอร์ก่อน (ดูวิธีตั้งใน worker/README.md)', T.WARN)
+            run_bg(lambda: hub.ping(server()),
+                   lambda out: set_note(f"ต่อเซิร์ฟเวอร์ได้ · คลังมี {out.get('sounds', 0)} เสียง · "
+                                        f"ไฟล์ใหญ่สุด {out.get('maxMb', hub.MAX_MB)} MB", T.OK),
+                   'กำลังทดสอบ…')
+
+        def load_queue():
+            if not server() or not state['key']:
+                return set_note('ต้องมีทั้งที่อยู่เซิร์ฟเวอร์และกุญแจผู้ดูแล', T.WARN)
+            run_bg(lambda: hub.pending(server(), state['key']), set_queue, 'กำลังโหลดคิว…')
+
+        def set_queue(rows):
+            state['queue'] = rows
+            draw_queue()
+            set_note(f'มี {len(rows)} เสียงรอตรวจ' if rows else 'ไม่มีเสียงรอตรวจ', T.OK)
+
+        def draw_queue():
+            for w in queue_list.winfo_children():
+                w.destroy()
+            for entry in state['queue']:
+                row = ctk.CTkFrame(queue_list, fg_color=T.SURFACE_2, corner_radius=9, height=42)
+                row.pack(fill='x', padx=6, pady=3)
+                row.pack_propagate(False)
+                who = f"  · {entry['by']}" if entry.get('by') else ''
+                ctk.CTkLabel(row, text=(entry.get('name') or '')[:38] + who, anchor='w', font=T.font(13),
+                             text_color=T.TEXT).pack(side='left', fill='x', expand=True, padx=(10, 6))
+                ctk.CTkLabel(row, text=f"{entry.get('size', 0) / 1048576:.1f} MB", width=56,
+                             font=T.font(11), text_color=T.TEXT_FAINT).pack(side='left')
+                ctk.CTkButton(row, text='✕', width=32, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.DANGER, text_color=T.TEXT_DIM,
+                              command=lambda e=entry: judge(e, False)).pack(side='right', padx=(0, 8))
+                ctk.CTkButton(row, text='✓', width=32, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.OK, text_color=T.TEXT,
+                              command=lambda e=entry: judge(e, True)).pack(side='right', padx=(0, 6))
+                ctk.CTkButton(row, text='▶', width=32, height=28, corner_radius=8, font=T.font(13),
+                              fg_color=T.INPUT, hover_color=T.SURFACE_3, text_color=T.TEXT_DIM,
+                              command=lambda e=entry: listen(e)).pack(side='right', padx=(0, 6))
+            if not state['queue']:
+                ctk.CTkLabel(queue_list, text='ไม่มีเสียงรอตรวจ', font=T.font(13),
+                             text_color=T.TEXT_FAINT).pack(pady=20)
+
+        def listen(entry):
+            def work():
+                blob = hub.fetch_pending(server(), state['key'], entry['id'], progress)
+                os.makedirs(PREVIEW_DIR, exist_ok=True)
+                path = os.path.join(PREVIEW_DIR, 'hub_' + entry['file'])
+                with open(path, 'wb') as fh:
+                    fh.write(blob)
+                return path
+
+            def done(path):
+                try:
+                    where = self.engine.preview(path)
+                    set_note(f"กำลังฟัง {entry['name'][:34]} ทาง {where} (ไม่เข้าเกม)", T.OK)
+                except Exception as exc:
+                    set_note(str(exc), T.WARN)
+
+            run_bg(work, done, 'กำลังดึงเสียงมาฟัง…')
+
+        def judge(entry, keep):
+            def done(_out):
+                state['queue'] = [e for e in state['queue'] if e['id'] != entry['id']]
+                draw_queue()
+                set_note(('ขึ้นคลังแล้ว: ' if keep else 'ทิ้งแล้ว: ') + entry['name'][:34], T.OK)
+                if keep:
+                    load_index()
+
+            run_bg(lambda: (hub.approve if keep else hub.reject)(server(), state['key'], entry['id']),
+                   done, 'กำลังอนุมัติ…' if keep else 'กำลังทิ้ง…')
+
+        # ============================================================
+        def show_side():
+            for frame in (browse, send, admin):
+                frame.pack_forget()
+            which = side.get()
+            frame = browse if which.startswith('⬇') else (send if which.startswith('⬆') else admin)
+            frame.pack(fill='both', expand=True, padx=22, pady=(8, 0))
+            if frame is send:
+                run_bg(lambda: {self._key(s['path']): sh_sha(s['path']) for s in self._rows()},
+                       lambda out: (state.update(sha=out), draw_mine()), 'กำลังดูว่าเสียงไหนอยู่ในคลังแล้ว…')
+
+        def sh_sha(path):
+            import soundshare
+            try:
+                return soundshare.sha256_of(path)
+            except OSError:
+                return ''
+
+        show_side()
+        load_index()
+        if not server():
+            set_note('ยังไม่ได้ตั้งที่อยู่เซิร์ฟเวอร์ — โหลดเสียงจากคลังได้ตามปกติ '
+                     'แต่ถ้าจะส่งเสียงเข้าคลังต้องตั้งก่อน (แท็บ "ผู้ดูแล")')
 
     # ---------------------------------------------------------------- phone remote
     def _remote_css(self):

@@ -47,6 +47,7 @@ ARGS = [
     '--hidden-import', 'remote',        # 📱 phone remote (stdlib web server)
     '--hidden-import', 'soundshare',    # 🤝 sharing sounds through a private GitHub repo
     '--hidden-import', 'tts',           # 🗣 type-to-speak (Google Translate voice)
+    '--hidden-import', 'hub',           # 🌐 คลังเสียงกลาง (อ่านจาก repo สาธารณะ ไม่ต้องล็อกอิน)
     '--collect-submodules', 'segno',    # 📱 QR code
     os.path.join(HERE, 'soundboard.py'),
 ]

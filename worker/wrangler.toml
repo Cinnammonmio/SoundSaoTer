@@ -1,0 +1,24 @@
+name = "soundsaoter-hub"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# ชื่อ repo ที่เก็บเสียง — แก้ได้ถ้าเปลี่ยนบัญชี GitHub
+[vars]
+PUBLIC_REPO = "Cinnammonmio/soundsaoter-hub"        # คลังสาธารณะ (คนโหลดเห็น)
+QUEUE_REPO  = "Cinnammonmio/soundsaoter-hub-queue"  # คิวรอตรวจ (private)
+PUBLIC_TAG  = "sounds"
+QUEUE_TAG   = "queue"
+MAX_MB      = "8"      # ไฟล์ใหญ่สุดที่รับเข้าคิว
+PER_HOUR    = "5"      # ส่งได้กี่เสียงต่อชั่วโมง ต่อหนึ่ง IP
+PER_DAY     = "15"
+QUEUE_CAP   = "300"    # คิวเต็มแล้วไม่รับเพิ่ม
+
+# นับโควตาต่อ IP — สร้างด้วย  npx wrangler kv namespace create RATE  แล้วเอา id มาใส่
+# ถ้ายังไม่ใส่ Worker ยังทำงานได้ แต่จะไม่มีตัวกันสแปม
+[[kv_namespaces]]
+binding = "RATE"
+id = "replace-with-kv-id"   # <- เอา id จากคำสั่งข้างบนมาวางแทนทั้งก้อนนี้
+
+# ความลับสองตัวตั้งด้วยคำสั่ง (ไม่เก็บในไฟล์นี้):
+#   npx wrangler secret put GITHUB_TOKEN   <- token ที่เขียนสอง repo ข้างบนได้
+#   npx wrangler secret put ADMIN_KEY      <- กุญแจผู้ดูแล ใช้กดอนุมัติในโปรแกรม
