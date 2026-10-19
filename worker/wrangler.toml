@@ -17,7 +17,7 @@ QUEUE_CAP   = "300"    # คิวเต็มแล้วไม่รับเ�
 # ถ้ายังไม่ใส่ Worker ยังทำงานได้ แต่จะไม่มีตัวกันสแปม
 [[kv_namespaces]]
 binding = "RATE"
-id = "replace-with-kv-id"   # <- เอา id จากคำสั่งข้างบนมาวางแทนทั้งก้อนนี้
+id = "b0583b702ca04e69936a37e7724560fa"
 
 # ความลับสองตัวตั้งด้วยคำสั่ง (ไม่เก็บในไฟล์นี้):
 #   npx wrangler secret put GITHUB_TOKEN   <- token ที่เขียนสอง repo ข้างบนได้
