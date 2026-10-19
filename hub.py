@@ -31,7 +31,7 @@ INDEX_NAME = 'index.json'
 PAGE_URL = f'https://github.com/{OWNER}/{REPO}'
 
 # เซิร์ฟเวอร์รับเสียงเข้าคิว (Cloudflare Worker) — ตั้งทับได้ในหน้าโปรแกรม
-DEFAULT_SERVER = ''
+DEFAULT_SERVER = 'https://soundsaoter-hub.cinnammonmio.workers.dev'
 MAX_MB = 8                               # ใหญ่กว่านี้ไม่รับเข้าคิว
 UA = {'User-Agent': 'SoundSaoTer'}
 AUDIO_EXT = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aiff', '.aif')
